@@ -31,5 +31,11 @@ advisory com crédito, se desejado.
   A aplicação aplica CSP e escapa conteúdo, mas trate o navegador como confiável.
 - Jobs e logs podem conter segredos. Mantenha `jobs/` e `logs/` em `700`/`600`
   e não coloque credenciais em `action`.
+- O rate limit é por IP. Com `trust_proxy_headers = true`, o servidor confia no
+  primeiro IP de `X-Forwarded-For`; só habilite atrás de um proxy confiável,
+  caso contrário o cliente pode falsificar o IP e escapar do limite.
+- A auditoria em `audit.jsonl` registra IP, método, path, status, job e duração.
+  Ela não grava token, corpo de request nem `action`, mas o path pode revelar
+  nomes de jobs; proteja o arquivo como dado sensível.
 - Se você encontrar token em log, histórico de shell, issue ou commit, rotacione
   imediatamente e remova o segredo do histórico.

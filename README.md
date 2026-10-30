@@ -21,6 +21,12 @@ poll_interval_seconds = 1
 command_timeout_seconds = 300
 max_concurrent_jobs = 4
 log_max_bytes = 10485760
+rate_limit_per_minute = 600
+auth_failure_limit = 10
+auth_failure_window_seconds = 60
+auth_lockout_seconds = 300
+trust_proxy_headers = false
+audit_log_file = "logs/audit.jsonl"
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -36,6 +42,18 @@ rede expõe a API **em HTTP sem TLS** — nesse caso use um proxy reverso com TL
 agendamentos excedentes são tentados de novo no próximo ciclo).
 `log_max_bytes` rotaciona `logs/<nome>.log` para `.log.1` ao atingir o limite
 (`0` desativa a rotação).
+
+`rate_limit_per_minute` limita requisições por IP em `/api` (`0` desativa) e
+`auth_failure_limit` bloqueia temporariamente um IP após N tokens inválidos,
+durante `auth_lockout_seconds` (`0` desativa o bloqueio). Requests bloqueadas
+respondem `429` com `Retry-After`. `trust_proxy_headers = true` faz o servidor
+usar o primeiro IP de `X-Forwarded-For`; habilite **somente** atrás de um proxy
+confiável, senão o cliente pode falsificar o IP e escapar do limite.
+
+`audit_log_file` recebe uma linha JSON por evento (`api.request`, `job.run`,
+`auth.failure`, `auth.lockout`, `request.rejected`) com data, IP, método, path,
+status, job e duração. Corpo de request, token e `action` **não** são gravados.
+O arquivo é `600` e rotaciona para `.1` em 5 MiB. Use `""` para desativar.
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -160,9 +178,9 @@ No `install`, o serviço é criado com:
   `ProtectSystem`, `CapabilityBoundingSet=`, `UMask=0077`, `LimitCORE=0`,
   entre outros).
 
-Após ativar, o script valida `/health`, `/`, `/app.css` e `/app.js`, garantindo
-que backend **e** frontend estão no ar. Reexecutar `install` preserva a config
-e os dados existentes.
+Após ativar, o script valida `/health`, `/readyz`, `/`, `/app.css` e `/app.js`,
+garantindo que backend **e** frontend estão no ar. Reexecutar `install` preserva
+a config e os dados existentes.
 
 > Atualizando uma instalação anterior: rode `sudo ./datatask.sh install` uma vez.
 > Ele move o token para `/etc/datatask/api_token`, aplica as permissões `600`/`700`
@@ -176,6 +194,10 @@ e os dados existentes.
 - O painel recebe `Content-Security-Policy`, `X-Content-Type-Options`,
   `X-Frame-Options`, `Referrer-Policy` e `Cache-Control: no-store` nas rotas
   `/api`.
+- Rate limit por IP e bloqueio temporário após falhas de autenticação; eventos
+  relevantes vão para o audit JSONL, sem token, corpo ou `action`.
+- `/readyz` informa se o scheduler está ativo (lag do último tick) e quantos
+  jobs estão em execução; `/health` continua sendo apenas liveness.
 - Cada comando roda em seu próprio grupo de processos; ao estourar o timeout,
   o grupo inteiro é encerrado (não apenas o `/bin/sh`).
 - O desligamento (SIGTERM/Ctrl+C) para o agendador e aguarda até 10 s pelos
@@ -211,10 +233,11 @@ envie `0`.
 
 ## API
 
-Todas as rotas abaixo, exceto `/health`, precisam do cabeçalho de autenticação
-Bearer, com o valor configurado em `api_token`.
+Todas as rotas abaixo, exceto `/health` e `/readyz`, precisam do cabeçalho de
+autenticação Bearer, com o valor configurado em `api_token`.
 
-- `GET /health` — estado do servidor
+- `GET /health` — liveness do processo
+- `GET /readyz` — prontidão: scheduler ativo, lag do último tick e jobs em execução
 - `GET /api/info` — versão, diretórios, intervalos, contagens e jobs em execução
 - `GET /api/jobs` — listar jobs
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,

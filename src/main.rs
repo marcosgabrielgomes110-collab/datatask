@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header},
+    extract::{ConnectInfo, Path, Query, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
@@ -55,6 +56,22 @@ struct Config {
     /// Rotate `NAME.log` to `NAME.log.1` once it reaches this size. `0` disables rotation.
     #[serde(default = "default_log_max_bytes")]
     log_max_bytes: u64,
+    /// Maximum API requests per IP per minute. `0` disables the limit.
+    #[serde(default = "default_rate_limit_per_minute")]
+    rate_limit_per_minute: u32,
+    /// Failed Bearer attempts allowed per IP before a temporary lockout. `0` disables it.
+    #[serde(default = "default_auth_failure_limit")]
+    auth_failure_limit: u32,
+    #[serde(default = "default_auth_failure_window_seconds")]
+    auth_failure_window_seconds: u64,
+    #[serde(default = "default_auth_lockout_seconds")]
+    auth_lockout_seconds: u64,
+    /// Trust `X-Forwarded-For` from a reverse proxy. Keep `false` when exposed directly.
+    #[serde(default)]
+    trust_proxy_headers: bool,
+    /// JSONL audit trail. Empty string disables it; omitted defaults to `<logs_dir>/audit.jsonl`.
+    #[serde(default)]
+    audit_log_file: Option<PathBuf>,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -63,6 +80,22 @@ fn default_max_concurrent_jobs() -> usize {
 
 fn default_log_max_bytes() -> u64 {
     10 * 1024 * 1024
+}
+
+fn default_rate_limit_per_minute() -> u32 {
+    600
+}
+
+fn default_auth_failure_limit() -> u32 {
+    10
+}
+
+fn default_auth_failure_window_seconds() -> u64 {
+    60
+}
+
+fn default_auth_lockout_seconds() -> u64 {
+    300
 }
 
 #[derive(Clone)]
@@ -75,6 +108,324 @@ struct AppState {
     process_groups: Arc<StdMutex<HashSet<u32>>>,
     job_slots: Arc<Semaphore>,
     token_digest: [u8; 32],
+    guard: Arc<AccessGuard>,
+    audit: Option<Arc<AuditLog>>,
+    last_tick: Arc<StdMutex<Option<Instant>>>,
+}
+
+impl AppState {
+    fn audit(&self, event: Value) {
+        if let Some(audit) = &self.audit {
+            audit.write(event);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RateLimits {
+    per_minute: u32,
+    failure_limit: u32,
+    failure_window: Duration,
+    lockout: Duration,
+}
+
+#[derive(Debug)]
+struct ClientState {
+    window_start: Instant,
+    requests: u32,
+    failure_window_start: Instant,
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+impl ClientState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            requests: 0,
+            failure_window_start: now,
+            failures: 0,
+            locked_until: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Rejection {
+    RateLimited(Duration),
+    AuthLocked(Duration),
+}
+
+impl Rejection {
+    fn retry_after(&self) -> Duration {
+        match self {
+            Self::RateLimited(duration) | Self::AuthLocked(duration) => *duration,
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::RateLimited(_) => "rate_limit",
+            Self::AuthLocked(_) => "auth_lockout",
+        }
+    }
+}
+
+/// In-memory per-IP request limiter and failed-authentication lockout.
+struct AccessGuard {
+    limits: RateLimits,
+    clients: StdMutex<HashMap<IpAddr, ClientState>>,
+}
+
+impl AccessGuard {
+    fn new(limits: RateLimits) -> Self {
+        Self {
+            limits,
+            clients: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn check(&self, ip: IpAddr, now: Instant) -> Result<(), Rejection> {
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if clients.len() > 4096 {
+            let stale = Duration::from_secs(120);
+            clients.retain(|_, state| {
+                now.saturating_duration_since(state.window_start) < stale
+                    || state.locked_until.is_some_and(|until| until > now)
+            });
+        }
+        let state = clients.entry(ip).or_insert_with(|| ClientState::new(now));
+
+        if let Some(until) = state.locked_until {
+            if until > now {
+                return Err(Rejection::AuthLocked(until.saturating_duration_since(now)));
+            }
+            state.locked_until = None;
+        }
+
+        if self.limits.per_minute > 0 {
+            let window = Duration::from_secs(60);
+            if now.saturating_duration_since(state.window_start) >= window {
+                state.window_start = now;
+                state.requests = 0;
+            }
+            if state.requests >= self.limits.per_minute {
+                let retry =
+                    window.saturating_sub(now.saturating_duration_since(state.window_start));
+                return Err(Rejection::RateLimited(retry.max(Duration::from_secs(1))));
+            }
+            state.requests = state.requests.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Records a failed Bearer attempt and returns the lockout duration when
+    /// the limit is reached.
+    fn record_failure(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        if self.limits.failure_limit == 0 {
+            return None;
+        }
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = clients.entry(ip).or_insert_with(|| ClientState::new(now));
+        if now.saturating_duration_since(state.failure_window_start) >= self.limits.failure_window {
+            state.failure_window_start = now;
+            state.failures = 0;
+        }
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= self.limits.failure_limit {
+            state.failures = 0;
+            state.failure_window_start = now;
+            state.locked_until = Some(now + self.limits.lockout);
+            return Some(self.limits.lockout);
+        }
+        None
+    }
+
+    fn record_success(&self, ip: IpAddr) {
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(state) = clients.get_mut(&ip) {
+            state.failures = 0;
+            state.locked_until = None;
+        }
+    }
+}
+
+const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+struct AuditLog {
+    path: PathBuf,
+    lock: StdMutex<()>,
+}
+
+impl AuditLog {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            lock: StdMutex::new(()),
+        }
+    }
+
+    fn write(&self, event: Value) {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Cannot create audit directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+        if let Ok(metadata) = fs::metadata(&self.path)
+            && metadata.len() >= AUDIT_MAX_BYTES
+        {
+            let mut rotated = self.path.as_os_str().to_owned();
+            rotated.push(".1");
+            let rotated = PathBuf::from(rotated);
+            let _ = fs::remove_file(&rotated);
+            if let Err(error) = fs::rename(&self.path, &rotated) {
+                eprintln!("Cannot rotate audit log: {error}");
+            }
+        }
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.path)
+        {
+            Ok(mut file) => {
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600));
+                if let Err(error) = writeln!(file, "{event}") {
+                    eprintln!("Cannot write audit log: {error}");
+                    return;
+                }
+                let _ = file.sync_data();
+            }
+            Err(error) => eprintln!("Cannot open audit log {}: {error}", self.path.display()),
+        }
+    }
+}
+
+fn client_ip(state: &AppState, request: &Request<Body>) -> IpAddr {
+    if state.config.trust_proxy_headers
+        && let Some(value) = request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+        && let Some(ip) = value
+            .split(',')
+            .next()
+            .and_then(|part| part.trim().parse::<IpAddr>().ok())
+    {
+        return ip;
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn job_from_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/jobs/")?;
+    let name = rest.split('/').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn retry_seconds(duration: Duration) -> u64 {
+    duration.as_secs_f64().ceil().max(1.0) as u64
+}
+
+fn too_many_requests(retry: Duration) -> Response {
+    let seconds = retry_seconds(retry);
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "Too many requests. Try again later."})),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+async fn api_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if !path.starts_with("/api/") {
+        return next.run(request).await;
+    }
+
+    let ip = client_ip(&state, &request);
+    if let Err(rejection) = state.guard.check(ip, Instant::now()) {
+        let retry = rejection.retry_after();
+        state.audit(json!({
+            "ts": Local::now().to_rfc3339(),
+            "event": "request.rejected",
+            "reason": rejection.reason(),
+            "method": request.method().as_str(),
+            "path": path,
+            "ip": ip.to_string(),
+            "retry_after_seconds": retry_seconds(retry),
+        }));
+        return too_many_requests(retry);
+    }
+
+    let method = request.method().clone();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || matches!(
+            method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        )
+    {
+        state.audit(json!({
+            "ts": Local::now().to_rfc3339(),
+            "event": "api.request",
+            "method": method.as_str(),
+            "path": path,
+            "job": job_from_path(&path),
+            "status": status.as_u16(),
+            "ip": ip.to_string(),
+            "duration_ms": started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        }));
+    }
+    response
+}
+
+fn scheduler_readiness(
+    last_tick: Option<Instant>,
+    interval: Duration,
+    now: Instant,
+) -> (bool, Option<f64>) {
+    match last_tick {
+        Some(tick) => {
+            let lag = now.saturating_duration_since(tick);
+            let max_lag = interval
+                .saturating_mul(3)
+                .saturating_add(Duration::from_secs(5));
+            (lag <= max_lag, Some(lag.as_secs_f64()))
+        }
+        None => (false, None),
+    }
 }
 
 /// Removes a job from the running set even if its task panics or is aborted.
@@ -127,6 +478,21 @@ struct RunOutcome {
     timed_out: bool,
     duration: Duration,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RunOrigin {
+    Manual,
+    Scheduled,
+}
+
+impl RunOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Scheduled => "scheduler",
+        }
+    }
 }
 
 impl RunOutcome {
@@ -305,6 +671,12 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     if config.logs_dir.is_relative() {
         config.logs_dir = base.join(&config.logs_dir);
     }
+    config.audit_log_file = match config.audit_log_file.take() {
+        None => Some(config.logs_dir.join("audit.jsonl")),
+        Some(path) if path.as_os_str().is_empty() => None,
+        Some(path) if path.is_relative() => Some(base.join(path)),
+        Some(path) => Some(path),
+    };
     let token = resolve_api_token(&mut config, base)?;
 
     if config.poll_interval_seconds == 0 {
@@ -315,6 +687,12 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     }
     if config.max_concurrent_jobs == 0 {
         return Err("max_concurrent_jobs must be greater than zero.".to_owned());
+    }
+    if config.auth_failure_limit > 0 && config.auth_failure_window_seconds == 0 {
+        return Err("auth_failure_window_seconds must be greater than zero.".to_owned());
+    }
+    if config.auth_failure_limit > 0 && config.auth_lockout_seconds == 0 {
+        return Err("auth_lockout_seconds must be greater than zero.".to_owned());
     }
     if let Ok(metadata) = fs::metadata(path)
         && !has_private_permissions(&metadata)
@@ -657,6 +1035,7 @@ async fn authenticate(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let ip = client_ip(&state, &request);
     let supplied = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -669,6 +1048,21 @@ async fn authenticate(
         bool::from(digest.as_slice().ct_eq(&state.token_digest))
     });
     if !authorized {
+        let now = Instant::now();
+        state.audit(json!({
+            "ts": Local::now().to_rfc3339(),
+            "event": "auth.failure",
+            "ip": ip.to_string(),
+            "path": request.uri().path(),
+        }));
+        if let Some(lockout) = state.guard.record_failure(ip, now) {
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "auth.lockout",
+                "ip": ip.to_string(),
+                "seconds": lockout.as_secs(),
+            }));
+        }
         let mut response = (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "Unauthorized"})),
@@ -679,6 +1073,7 @@ async fn authenticate(
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         return response;
     }
+    state.guard.record_success(ip);
     next.run(request).await
 }
 
@@ -716,6 +1111,29 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> Response {
+    let now = Instant::now();
+    let last_tick = *state
+        .last_tick
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let interval = Duration::from_secs(state.config.poll_interval_seconds);
+    let (ready, lag) = scheduler_readiness(last_tick, interval, now);
+    let body = json!({
+        "status": if ready { "ready" } else { "starting" },
+        "scheduler_lag_seconds": lag,
+        "poll_interval_seconds": state.config.poll_interval_seconds,
+        "running": lock_running(&state).len(),
+        "jobs_dir": state.config.jobs_dir.is_dir(),
+        "now": Local::now().to_rfc3339(),
+    });
+    if ready {
+        (StatusCode::OK, Json(body)).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
 }
 
 async fn dashboard() -> impl IntoResponse {
@@ -880,7 +1298,7 @@ async fn delete_job(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn run_job(state: Arc<AppState>, name: &str) -> ApiResult<()> {
+async fn run_job(state: Arc<AppState>, name: &str, origin: RunOrigin) -> ApiResult<()> {
     // Cap the total number of concurrent commands so a burst of schedules cannot
     // exhaust the machine. Scheduled runs that hit the cap are skipped and
     // retried on the next tick.
@@ -918,6 +1336,15 @@ async fn run_job(state: Arc<AppState>, name: &str) -> ApiResult<()> {
 
     let outcome = execute_command(&state, &job).await;
     record_outcome(&state, name, &outcome).await;
+    state.audit(json!({
+        "ts": Local::now().to_rfc3339(),
+        "event": "job.run",
+        "job": name,
+        "origin": origin.as_str(),
+        "result": outcome.label(),
+        "exit_code": outcome.exit_code,
+        "duration_ms": outcome.duration.as_millis().min(u64::MAX as u128) as u64,
+    }));
 
     match outcome.label() {
         "success" => Ok(()),
@@ -1149,7 +1576,7 @@ async fn run_job_endpoint(
     }
     let spawned_name = name.clone();
     tokio::spawn(async move {
-        if let Err(error) = run_job(state, &spawned_name).await {
+        if let Err(error) = run_job(state, &spawned_name, RunOrigin::Manual).await {
             eprintln!("Manual run of '{spawned_name}' failed: {}", error.1);
         }
     });
@@ -1316,6 +1743,9 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "command_timeout_seconds": state.config.command_timeout_seconds,
         "max_concurrent_jobs": state.config.max_concurrent_jobs,
         "log_max_bytes": state.config.log_max_bytes,
+        "rate_limit_per_minute": state.config.rate_limit_per_minute,
+        "auth_failure_limit": state.config.auth_failure_limit,
+        "auth_lockout_seconds": state.config.auth_lockout_seconds,
         "jobs_dir": state.config.jobs_dir.display().to_string(),
         "logs_dir": state.config.logs_dir.display().to_string(),
         "job_count": jobs.len(),
@@ -1353,6 +1783,10 @@ async fn scheduler(state: Arc<AppState>) {
     let mut ticker = time::interval(interval);
     loop {
         ticker.tick().await;
+        *state
+            .last_tick
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
         let now = Local::now();
         let entries = match fs::read_dir(&state.config.jobs_dir) {
             Ok(entries) => entries,
@@ -1402,7 +1836,7 @@ async fn scheduler(state: Arc<AppState>) {
                     let state = state.clone();
                     let job_name = job.name.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = run_job(state, &job_name).await {
+                        if let Err(error) = run_job(state, &job_name, RunOrigin::Scheduled).await {
                             eprintln!("Job '{job_name}' failed: {}", error.1);
                         }
                     });
@@ -1452,6 +1886,18 @@ fn prepare_storage(config: &Config) -> std::io::Result<()> {
             {
                 let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
             }
+        }
+    }
+
+    if let Some(audit) = &config.audit_log_file {
+        if let Some(parent) = audit.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+        if audit.is_file() {
+            let _ = fs::set_permissions(audit, fs::Permissions::from_mode(0o600));
         }
     }
     Ok(())
@@ -1535,6 +1981,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Arc::new(config);
+    let guard = Arc::new(AccessGuard::new(RateLimits {
+        per_minute: config.rate_limit_per_minute,
+        failure_limit: config.auth_failure_limit,
+        failure_window: Duration::from_secs(config.auth_failure_window_seconds),
+        lockout: Duration::from_secs(config.auth_lockout_seconds),
+    }));
+    let audit = config
+        .audit_log_file
+        .clone()
+        .map(|path| Arc::new(AuditLog::new(path)));
     let state = Arc::new(AppState {
         config: config.clone(),
         repository_lock: Arc::new(Mutex::new(())),
@@ -1542,10 +1998,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process_groups: Arc::new(StdMutex::new(HashSet::new())),
         job_slots: Arc::new(Semaphore::new(config.max_concurrent_jobs)),
         token_digest: digest,
+        guard,
+        audit,
+        last_tick: Arc::new(StdMutex::new(None)),
     });
     let scheduler_handle = tokio::spawn(scheduler(state.clone()));
 
-    let api = Router::new()
+    let api: Router = Router::new()
         .route("/api/info", get(get_info))
         .route("/api/jobs", get(get_jobs).post(create_job))
         .route(
@@ -1562,22 +2021,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/jobs/{name}/logs/tail", get(tail_job_logs))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state.clone());
-    let app = Router::new()
+    let readiness: Router = Router::new()
+        .route("/readyz", get(readyz))
+        .with_state(state.clone());
+    let app: Router = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(script))
         .route("/assets/app.css", get(stylesheet))
         .route("/assets/app.js", get(script))
+        .merge(readiness)
         .merge(api)
-        .layer(middleware::from_fn(security_headers));
+        .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(state.clone(), api_guard));
 
     let address = format!("{}:{}", config.bind_address, config.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("DataTask API listening on http://{address}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     // Stop scheduling new work, then give in-flight commands a short grace
     // period so their logs get a proper footer.
@@ -1651,5 +2118,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rate_limits_per_window_and_resets() {
+        let guard = AccessGuard::new(RateLimits {
+            per_minute: 2,
+            failure_limit: 0,
+            failure_window: Duration::from_secs(60),
+            lockout: Duration::from_secs(5),
+        });
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let start = Instant::now();
+
+        assert!(guard.check(ip, start).is_ok());
+        assert!(guard.check(ip, start).is_ok());
+        assert!(matches!(
+            guard.check(ip, start),
+            Err(Rejection::RateLimited(_))
+        ));
+        assert!(guard.check(ip, start + Duration::from_secs(61)).is_ok());
+    }
+
+    #[test]
+    fn failed_auth_locks_out_and_success_resets() {
+        let guard = AccessGuard::new(RateLimits {
+            per_minute: 100,
+            failure_limit: 2,
+            failure_window: Duration::from_secs(60),
+            lockout: Duration::from_secs(5),
+        });
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let start = Instant::now();
+
+        assert_eq!(guard.record_failure(ip, start), None);
+        assert_eq!(
+            guard.record_failure(ip, start),
+            Some(Duration::from_secs(5))
+        );
+        assert!(matches!(
+            guard.check(ip, start + Duration::from_secs(1)),
+            Err(Rejection::AuthLocked(_))
+        ));
+        assert!(guard.check(ip, start + Duration::from_secs(6)).is_ok());
+        guard.record_success(ip);
+        assert_eq!(
+            guard.record_failure(ip, start + Duration::from_secs(7)),
+            None
+        );
+    }
+
+    #[test]
+    fn readiness_requires_a_recent_scheduler_tick() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        assert!(!scheduler_readiness(None, interval, now).0);
+        assert!(scheduler_readiness(Some(now), interval, now).0);
+        assert!(!scheduler_readiness(Some(now - Duration::from_secs(9)), interval, now).0);
+        assert_eq!(job_from_path("/api/jobs/task/logs"), Some("task"));
+        assert_eq!(job_from_path("/api/jobs"), None);
     }
 }

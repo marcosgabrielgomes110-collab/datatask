@@ -11,6 +11,11 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 - Suporte a `api_token_file` com verificação de permissões `600`.
 - Limite de jobs simultâneos (`max_concurrent_jobs`) e rotação de logs
   (`log_max_bytes`).
+- Rate limit por IP (`rate_limit_per_minute`) e bloqueio temporário após falhas
+  de autenticação (`auth_failure_limit`/`auth_lockout_seconds`).
+- Auditoria JSONL de operações, execuções e falhas de autenticação, com rotação
+  em 5 MiB e sem token/corpo/`action`.
+- Endpoint `/readyz` com heartbeat do scheduler e jobs em execução.
 - Cabeçalhos de segurança e `Cache-Control: no-store` nas rotas da API.
 - Shutdown gracioso com encerramento do grupo de processos dos jobs.
 - CI, templates de issue/PR, política de segurança e guia de contribuição.

@@ -351,6 +351,8 @@ write_config() {
   local file="$1" bind="$2" port="$3" jobs="$4" logs="$5"
   local poll="${6:-1}" timeout="${7:-300}" token="${8:-$(new_token)}"
   local max_jobs="${9:-4}" log_max="${10:-10485760}"
+  local rate_limit="${11:-600}" auth_limit="${12:-10}"
+  local auth_window="${13:-60}" auth_lockout="${14:-300}"
   mkdir -p "$(dirname "$file")"
   local old_umask
   old_umask="$(umask)"
@@ -366,6 +368,10 @@ poll_interval_seconds = $poll
 command_timeout_seconds = $timeout
 max_concurrent_jobs = $max_jobs
 log_max_bytes = $log_max
+rate_limit_per_minute = $rate_limit
+auth_failure_limit = $auth_limit
+auth_failure_window_seconds = $auth_window
+auth_lockout_seconds = $auth_lockout
 EOF
   umask "$old_umask"
 }
@@ -537,6 +543,7 @@ cmd_setup() {
 
   # Valores atuais (ou padrões) aparecem entre colchetes: Enter mantém.
   local cur_bind cur_port cur_jobs cur_logs cur_poll cur_timeout cur_token cur_token_file
+  local cur_max_jobs cur_log_max cur_rate cur_auth_limit cur_auth_window cur_auth_lockout
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -545,6 +552,12 @@ cmd_setup() {
   cur_timeout="$(config_get "$conf" command_timeout_seconds)"
   cur_token="$(config_token "$conf")"
   cur_token_file="$(config_get "$conf" api_token_file)"
+  cur_max_jobs="$(config_get "$conf" max_concurrent_jobs)"
+  cur_log_max="$(config_get "$conf" log_max_bytes)"
+  cur_rate="$(config_get "$conf" rate_limit_per_minute)"
+  cur_auth_limit="$(config_get "$conf" auth_failure_limit)"
+  cur_auth_window="$(config_get "$conf" auth_failure_window_seconds)"
+  cur_auth_lockout="$(config_get "$conf" auth_lockout_seconds)"
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
   cur_port="${cur_port:-$DEFAULT_PORT}"
@@ -556,6 +569,12 @@ cmd_setup() {
   validate_uint "$cur_port" && (( cur_port >= 1 && cur_port <= 65535 )) || cur_port="$DEFAULT_PORT"
   validate_uint "$cur_poll" && (( cur_poll >= 1 && cur_poll <= 3600 )) || cur_poll=1
   validate_uint "$cur_timeout" && (( cur_timeout >= 1 && cur_timeout <= 86400 )) || cur_timeout=300
+  validate_uint "$cur_max_jobs" && (( cur_max_jobs >= 1 && cur_max_jobs <= 256 )) || cur_max_jobs=4
+  validate_uint "$cur_log_max" || cur_log_max=10485760
+  validate_uint "$cur_rate" || cur_rate=600
+  validate_uint "$cur_auth_limit" || cur_auth_limit=10
+  validate_uint "$cur_auth_window" || cur_auth_window=60
+  validate_uint "$cur_auth_lockout" || cur_auth_lockout=300
   [[ -n "$cur_jobs" ]] || cur_jobs="jobs"
   [[ -n "$cur_logs" ]] || cur_logs="logs"
   [[ -n "$cur_bind" ]] || cur_bind="$DEFAULT_BIND"
@@ -579,7 +598,8 @@ cmd_setup() {
   logs="$(expand_path "$logs")"
   [[ -n "$jobs" && -n "$logs" ]] || die "Os diretórios de tarefas e logs não podem ficar vazios."
 
-  write_config "$conf" "$bind" "$port" "$jobs" "$logs" "$poll" "$timeout" "$token"
+  write_config "$conf" "$bind" "$port" "$jobs" "$logs" "$poll" "$timeout" "$token" \
+    "$cur_max_jobs" "$cur_log_max" "$cur_rate" "$cur_auth_limit" "$cur_auth_window" "$cur_auth_lockout"
   chmod 600 "$conf" 2>/dev/null || true
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
@@ -857,10 +877,10 @@ EOF
 
 wait_health() {
   local conf="$1" url tries=30
-  url="$(panel_url "$conf")/health"
+  url="$(panel_url "$conf")"
   for ((attempt = 1; attempt <= tries; attempt++)); do
-    if http_get "$url" >/dev/null 2>&1; then
-      ok "Serviço respondendo em $(panel_url "$conf")"
+    if http_get "${url}/health" >/dev/null 2>&1 && http_get "${url}/readyz" >/dev/null 2>&1; then
+      ok "Serviço respondendo em ${url} (health + readyz)"
       return 0
     fi
     sleep 1
@@ -1105,6 +1125,11 @@ cmd_status() {
   printf '\n  Painel: %s\n' "$url"
   if http_get "${url}/health" >/dev/null 2>&1; then
     ok "Health check OK"
+    if http_get "${url}/readyz" >/dev/null 2>&1; then
+      ok "Readiness check OK"
+    else
+      warn "Readiness indisponível (scheduler ainda iniciando ou parado)"
+    fi
     verify_ui "$CONF_FILE"
   else
     warn "Health check falhou"

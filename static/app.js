@@ -629,6 +629,8 @@
       ["Timeout padrão", `${info.command_timeout_seconds}s`],
       ["Jobs simultâneos", String(info.max_concurrent_jobs ?? "—")],
       ["Rotação de log", info.log_max_bytes ? formatBytes(info.log_max_bytes) : "desativada"],
+      ["Rate limit", info.rate_limit_per_minute ? `${info.rate_limit_per_minute}/min por IP` : "desativado"],
+      ["Bloqueio de auth", info.auth_failure_limit ? `${info.auth_failure_limit} falhas · ${info.auth_lockout_seconds}s` : "desativado"],
       ["Diretório de tarefas", info.jobs_dir],
       ["Diretório de logs", info.logs_dir],
       ["Horário do servidor", new Date(info.now).toLocaleString("pt-BR")]
