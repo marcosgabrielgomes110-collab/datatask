@@ -1623,13 +1623,12 @@ mod tests {
         assert_eq!(normalize_timeout(0).unwrap(), None);
         assert_eq!(normalize_timeout(60).unwrap(), Some(60));
         assert!(normalize_timeout(MAX_JOB_TIMEOUT_SECONDS + 1).is_err());
-        assert!(
-            normalize_working_dir(Some("/tmp/opencode"))
-                .unwrap()
-                .is_some()
-        );
+        let existing = std::env::temp_dir();
+        assert!(normalize_working_dir(existing.to_str()).unwrap().is_some());
         assert_eq!(normalize_working_dir(Some("")).unwrap(), None);
-        assert!(normalize_working_dir(Some("/no/such/dir")).is_err());
+        let missing = existing.join(format!("datatask-missing-{}", std::process::id()));
+        assert!(!missing.exists());
+        assert!(normalize_working_dir(missing.to_str()).is_err());
     }
 
     #[test]
