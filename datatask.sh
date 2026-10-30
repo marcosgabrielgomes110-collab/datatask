@@ -314,6 +314,11 @@ config_set_number() {
   fi
 }
 
+# Escreve um valor TOML bruto (booleano, array etc.), sem aspas.
+config_set_raw() {
+  config_set_number "$1" "$2" "$3"
+}
+
 config_remove() {
   local file="$1" key="$2" tmp
   [[ -f "$file" ]] || return 0
@@ -372,6 +377,9 @@ rate_limit_per_minute = $rate_limit
 auth_failure_limit = $auth_limit
 auth_failure_window_seconds = $auth_window
 auth_lockout_seconds = $auth_lockout
+tls_terminated_by_proxy = false
+trust_proxy_headers = false
+audit_log_file = "logs/audit.jsonl"
 EOF
   umask "$old_umask"
 }
@@ -544,6 +552,7 @@ cmd_setup() {
   # Valores atuais (ou padrões) aparecem entre colchetes: Enter mantém.
   local cur_bind cur_port cur_jobs cur_logs cur_poll cur_timeout cur_token cur_token_file
   local cur_max_jobs cur_log_max cur_rate cur_auth_limit cur_auth_window cur_auth_lockout
+  local prev_tls prev_trust prev_audit prev_audit_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -558,6 +567,12 @@ cmd_setup() {
   cur_auth_limit="$(config_get "$conf" auth_failure_limit)"
   cur_auth_window="$(config_get "$conf" auth_failure_window_seconds)"
   cur_auth_lockout="$(config_get "$conf" auth_lockout_seconds)"
+  prev_tls="$(config_get "$conf" tls_terminated_by_proxy)"
+  prev_trust="$(config_get "$conf" trust_proxy_headers)"
+  if grep -qE '^[[:space:]]*audit_log_file[[:space:]]*=' "$conf"; then
+    prev_audit="$(config_get "$conf" audit_log_file)"
+    prev_audit_set=1
+  fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
   cur_port="${cur_port:-$DEFAULT_PORT}"
@@ -598,9 +613,23 @@ cmd_setup() {
   logs="$(expand_path "$logs")"
   [[ -n "$jobs" && -n "$logs" ]] || die "Os diretórios de tarefas e logs não podem ficar vazios."
 
+  if [[ "$bind" != "127.0.0.1" && "$bind" != "::1" && "$bind" != "localhost" ]]; then
+    if [[ "$prev_tls" != "true" ]]; then
+      warn "Bind em '$bind' sem tls_terminated_by_proxy: o servidor vai recusar iniciar."
+      warn "Use 127.0.0.1 atrás de um proxy TLS ou defina tls_terminated_by_proxy = true (com firewall)."
+    elif [[ "$prev_trust" != "true" ]]; then
+      warn "Considere trust_proxy_headers = true para o rate limit distinguir clientes atrás do proxy."
+    fi
+  fi
+
   write_config "$conf" "$bind" "$port" "$jobs" "$logs" "$poll" "$timeout" "$token" \
     "$cur_max_jobs" "$cur_log_max" "$cur_rate" "$cur_auth_limit" "$cur_auth_window" "$cur_auth_lockout"
   chmod 600 "$conf" 2>/dev/null || true
+
+  # Preserva opções avançadas que não têm prompt no setup.
+  [[ -n "$prev_tls" ]] && config_set_raw "$conf" tls_terminated_by_proxy "$prev_tls"
+  [[ -n "$prev_trust" ]] && config_set_raw "$conf" trust_proxy_headers "$prev_trust"
+  [[ "$prev_audit_set" -eq 1 ]] && config_set_string "$conf" audit_log_file "$prev_audit"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then
@@ -972,6 +1001,13 @@ prepare_service_files() {
   fi
   jobs="${jobs:-$JOBS_DIR}"
   logs="${logs:-$LOGS_DIR}"
+
+  local bind_addr tls_proxy
+  bind_addr="$(config_get "$CONF_FILE" bind_address)"
+  tls_proxy="$(config_get "$CONF_FILE" tls_terminated_by_proxy)"
+  if [[ "$bind_addr" != "127.0.0.1" && "$bind_addr" != "::1" && "$bind_addr" != "localhost" && "$tls_proxy" != "true" ]]; then
+    die "bind_address='${bind_addr}' exige TLS. Use 127.0.0.1 atrás de um proxy TLS ou defina tls_terminated_by_proxy = true em $CONF_FILE (somente com firewall restringindo a porta ao proxy)."
+  fi
 
   install -d -m 700 "$DATA_DIR" "$jobs" "$logs"
   chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$DATA_DIR"

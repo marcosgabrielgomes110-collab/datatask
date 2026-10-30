@@ -16,6 +16,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 - Auditoria JSONL de operações, execuções e falhas de autenticação, com rotação
   em 5 MiB e sem token/corpo/`action`.
 - Endpoint `/readyz` com heartbeat do scheduler e jobs em execução.
+- Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
+  `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Cabeçalhos de segurança e `Cache-Control: no-store` nas rotas da API.
 - Shutdown gracioso com encerramento do grupo de processos dos jobs.
 - CI, templates de issue/PR, política de segurança e guia de contribuição.

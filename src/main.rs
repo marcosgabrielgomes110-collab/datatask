@@ -43,6 +43,10 @@ const SHUTDOWN_GRACE_SECONDS: u64 = 10;
 struct Config {
     bind_address: String,
     port: u16,
+    /// Assert that a trusted reverse proxy terminates TLS in front of this
+    /// process. Required when `bind_address` is not loopback.
+    #[serde(default)]
+    tls_terminated_by_proxy: bool,
     #[serde(default)]
     api_token: Option<String>,
     #[serde(default)]
@@ -96,6 +100,13 @@ fn default_auth_failure_window_seconds() -> u64 {
 
 fn default_auth_lockout_seconds() -> u64 {
     300
+}
+
+fn bind_is_loopback(value: &str) -> bool {
+    value.eq_ignore_ascii_case("localhost")
+        || value
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 #[derive(Clone)]
@@ -359,6 +370,52 @@ fn too_many_requests(retry: Duration) -> Response {
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
+}
+
+fn https_guard_rejects(
+    tls_proxy: bool,
+    path: &str,
+    peer_is_loopback: bool,
+    forwarded_https: bool,
+) -> bool {
+    tls_proxy && !peer_is_loopback && !matches!(path, "/health" | "/readyz") && !forwarded_https
+}
+
+async fn https_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !state.config.tls_terminated_by_proxy {
+        return next.run(request).await;
+    }
+    let path = request.uri().path().to_owned();
+    let peer_is_loopback = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip().is_loopback())
+        .unwrap_or(true);
+    let forwarded_https = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"));
+    if https_guard_rejects(
+        state.config.tls_terminated_by_proxy,
+        &path,
+        peer_is_loopback,
+        forwarded_https,
+    ) {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(json!({
+                "error": "HTTPS required. Access this service through the configured TLS proxy."
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn api_guard(
@@ -693,6 +750,27 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     }
     if config.auth_failure_limit > 0 && config.auth_lockout_seconds == 0 {
         return Err("auth_lockout_seconds must be greater than zero.".to_owned());
+    }
+    if !bind_is_loopback(&config.bind_address) && !config.tls_terminated_by_proxy {
+        return Err(format!(
+            "bind_address '{}' would expose plaintext HTTP. Keep bind_address = \"127.0.0.1\" behind a TLS reverse proxy, or set tls_terminated_by_proxy = true only when the port is reachable exclusively by that proxy.",
+            config.bind_address
+        ));
+    }
+    if config.tls_terminated_by_proxy
+        && !bind_is_loopback(&config.bind_address)
+        && !config.trust_proxy_headers
+    {
+        eprintln!(
+            "warning: tls_terminated_by_proxy is set but trust_proxy_headers is false; \
+             rate limiting will see the proxy IP instead of each client."
+        );
+    }
+    if config.tls_terminated_by_proxy && !bind_is_loopback(&config.bind_address) {
+        eprintln!(
+            "warning: bind_address '{}' must be firewalled so only the TLS proxy can reach this port.",
+            config.bind_address
+        );
     }
     if let Ok(metadata) = fs::metadata(path)
         && !has_private_permissions(&metadata)
@@ -1088,7 +1166,11 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &'static st
     }
 }
 
-async fn security_headers(request: Request<Body>, next: Next) -> Response {
+async fn security_headers(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let is_api = request.uri().path().starts_with("/api/");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -1103,6 +1185,9 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     insert_header(headers, "cross-origin-opener-policy", "same-origin");
     insert_header(headers, "cross-origin-resource-policy", "same-origin");
     insert_header(headers, "content-security-policy", CONTENT_SECURITY_POLICY);
+    if state.config.tls_terminated_by_proxy {
+        insert_header(headers, "strict-transport-security", "max-age=31536000");
+    }
     if is_api {
         insert_header(headers, "cache-control", "no-store");
     }
@@ -1739,6 +1824,8 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "version": env!("CARGO_PKG_VERSION"),
         "bind_address": state.config.bind_address,
         "port": state.config.port,
+        "tls_terminated_by_proxy": state.config.tls_terminated_by_proxy,
+        "trust_proxy_headers": state.config.trust_proxy_headers,
         "poll_interval_seconds": state.config.poll_interval_seconds,
         "command_timeout_seconds": state.config.command_timeout_seconds,
         "max_concurrent_jobs": state.config.max_concurrent_jobs,
@@ -1970,16 +2057,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(token);
     prepare_storage(&config)?;
 
-    if !matches!(
-        config.bind_address.as_str(),
-        "127.0.0.1" | "::1" | "localhost"
-    ) {
-        eprintln!(
-            "warning: binding to {} exposes the plaintext HTTP API; put it behind a TLS reverse proxy.",
-            config.bind_address
-        );
-    }
-
     let config = Arc::new(config);
     let guard = Arc::new(AccessGuard::new(RateLimits {
         per_minute: config.rate_limit_per_minute,
@@ -2033,8 +2110,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/assets/app.js", get(script))
         .merge(readiness)
         .merge(api)
-        .layer(middleware::from_fn(security_headers))
-        .layer(middleware::from_fn_with_state(state.clone(), api_guard));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), api_guard))
+        .layer(middleware::from_fn_with_state(state.clone(), https_guard));
 
     let address = format!("{}:{}", config.bind_address, config.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
@@ -2177,5 +2258,23 @@ mod tests {
         assert!(!scheduler_readiness(Some(now - Duration::from_secs(9)), interval, now).0);
         assert_eq!(job_from_path("/api/jobs/task/logs"), Some("task"));
         assert_eq!(job_from_path("/api/jobs"), None);
+    }
+
+    #[test]
+    fn enforces_loopback_or_tls_proxy() {
+        assert!(bind_is_loopback("127.0.0.1"));
+        assert!(bind_is_loopback("127.0.0.2"));
+        assert!(bind_is_loopback("::1"));
+        assert!(bind_is_loopback("localhost"));
+        assert!(!bind_is_loopback("0.0.0.0"));
+        assert!(!bind_is_loopback("::"));
+        assert!(!bind_is_loopback("192.168.0.10"));
+
+        assert!(!https_guard_rejects(false, "/api/jobs", false, false));
+        assert!(!https_guard_rejects(true, "/health", false, false));
+        assert!(!https_guard_rejects(true, "/readyz", false, false));
+        assert!(!https_guard_rejects(true, "/api/jobs", true, false));
+        assert!(!https_guard_rejects(true, "/api/jobs", false, true));
+        assert!(https_guard_rejects(true, "/api/jobs", false, false));
     }
 }

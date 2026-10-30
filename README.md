@@ -11,6 +11,8 @@ Edite `config.toml`:
 ```toml
 bind_address = "127.0.0.1"
 port = 8080
+# Necessário apenas se bind_address não for loopback e houver proxy TLS na frente.
+tls_terminated_by_proxy = false
 # Recomendado: token em arquivo separado, com permissão 600.
 api_token_file = "/etc/datatask/api_token"
 # Alternativa (legado): token direto na config.
@@ -33,9 +35,10 @@ Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
 `api_token_file` ou `api_token`. O arquivo do token precisa ter permissão
 `600`; o servidor recusa iniciar se grupo/outros puderem lê-lo. Todas as rotas
 `/api` exigem autenticação Bearer. Por padrão, o servidor fica restrito ao
-próprio computador (`127.0.0.1`). Alterar `bind_address` para uma interface de
-rede expõe a API **em HTTP sem TLS** — nesse caso use um proxy reverso com TLS
-(Caddy/nginx) e não exponha a porta diretamente.
+próprio computador (`127.0.0.1`). Se `bind_address` não for loopback, o servidor
+**recusa iniciar** a menos que `tls_terminated_by_proxy = true` confirme que há
+um proxy TLS na frente; mesmo assim, restrinja a porta ao proxy no firewall. A
+API não fala TLS nativamente — veja a seção abaixo.
 
 `command_timeout_seconds` limita a duração de cada comando.
 `max_concurrent_jobs` limita quantos comandos rodam ao mesmo tempo (os
@@ -59,6 +62,51 @@ O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
 deve ser `600`; o `install` do script já faz isso e move o token do serviço para
 `/etc/datatask/api_token`.
+
+## Exposição na rede e TLS
+
+O DataTask **não termina TLS**. O modo recomendado é manter
+`bind_address = "127.0.0.1"` e colocar um proxy no mesmo host:
+
+```caddyfile
+tasks.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+O Caddy define `X-Forwarded-Proto`/`X-Forwarded-For` automaticamente. Para nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name tasks.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Se o proxy estiver em **outro host**, o bind precisa ser acessível a ele:
+
+```toml
+bind_address = "0.0.0.0"
+tls_terminated_by_proxy = true
+trust_proxy_headers = true
+```
+
+Nesse caso:
+
+- o firewall deve permitir a porta **somente** para o IP do proxy;
+- `tls_terminated_by_proxy = true` é uma afirmação explícita, não detecta TLS;
+- requests de peers não-loopback sem `X-Forwarded-Proto: https` recebem `426`
+  (exceto `/health` e `/readyz`);
+- o servidor envia `Strict-Transport-Security` quando o modo proxy TLS está ativo;
+- `trust_proxy_headers` só deve ser habilitado atrás de um proxy confiável,
+  pois `X-Forwarded-For` pode ser falsificado por quem alcança a porta direto.
 
 ## Executar
 
@@ -196,6 +244,8 @@ a config e os dados existentes.
   `/api`.
 - Rate limit por IP e bloqueio temporário após falhas de autenticação; eventos
   relevantes vão para o audit JSONL, sem token, corpo ou `action`.
+- Fora de loopback, o boot exige `tls_terminated_by_proxy = true`; o modo proxy
+  rejeita requests não-loopback sem `X-Forwarded-Proto: https` e envia HSTS.
 - `/readyz` informa se o scheduler está ativo (lag do último tick) e quantos
   jobs estão em execução; `/health` continua sendo apenas liveness.
 - Cada comando roda em seu próprio grupo de processos; ao estourar o timeout,

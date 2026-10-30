@@ -622,6 +622,8 @@
     const items = [
       ["Versão", `v${info.version}`],
       ["Endereço", `${info.bind_address}:${info.port}`],
+      ["TLS via proxy", info.tls_terminated_by_proxy ? "sim" : "não"],
+      ["X-Forwarded-For", info.trust_proxy_headers ? "confiado" : "ignorado"],
       ["Tarefas cadastradas", String(info.job_count)],
       ["Tarefas ativas", String(info.active_count)],
       ["Executando agora", running ? `${running} (${info.running.join(", ")})` : "nenhuma"],

@@ -25,8 +25,12 @@ advisory com crédito, se desejado.
 
 - **Token da API = execução de comandos.** Qualquer pessoa com o token pode
   criar jobs e rodar comandos como o usuário do serviço.
-- O servidor fala HTTP puro. Não exponha `bind_address` fora de loopback sem um
-  proxy reverso com TLS.
+- O servidor fala HTTP puro. Bind fora de loopback é recusado no boot, a menos
+  que `tls_terminated_by_proxy = true` indique um proxy TLS na frente. Mesmo
+  assim, restrinja a porta ao IP do proxy no firewall.
+- Com `tls_terminated_by_proxy = true`, peers não-loopback precisam enviar
+  `X-Forwarded-Proto: https` (exceto `/health` e `/readyz`); isso não substitui
+  firewall, pois o header é falsificável por quem alcança a porta diretamente.
 - O painel guarda o token em `sessionStorage`; qualquer XSS teria acesso a ele.
   A aplicação aplica CSP e escapa conteúdo, mas trate o navegador como confiável.
 - Jobs e logs podem conter segredos. Mantenha `jobs/` e `logs/` em `700`/`600`
