@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#070b14">
+  <meta name="description" content="DataTask — agendador de tarefas local com painel de controle, logs em tempo real e API REST.">
+  <style>
+    /* Fallback mínimo: mantém o tema escuro mesmo se app.css não carregar. */
+    html, body { margin: 0; background: #070b14; color: #e8eef9; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+    [hidden] { display: none !important; }
+  </style>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%234f6ef7'/%3E%3Cpath d='M20 16h13a16 16 0 0 1 0 32H20z' fill='none' stroke='%23fff' stroke-width='6' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <title>DataTask · automação local</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <symbol id="i-tasks" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="16" rx="2.5"/><path d="M8 9h8M8 13h8M8 17h4"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h8M16 7h4M4 17h4M12 17h8"/><circle cx="14" cy="7" r="2.2"/><circle cx="10" cy="17" r="2.2"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5a8 8 0 1 0-2.4 5.9"/><path d="M20 4.5v7h-7"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 4.8v14.4L19.5 12z"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8.5 5v14M15.5 5v14"/></symbol>
+      <symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.6 6.6a8 8 0 1 0 10.8 0"/></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h7.5L19 9v11.5H6z"/><path d="M13.5 3.5V9H19"/><path d="M9 13h6M9 16.5h6"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4l11-11-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11.5" height="11.5" rx="2"/><path d="M6 15H4.5v-10a1 1 0 0 1 1-1h10V6"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13"/><path d="M10 11v5.5M14 11v5.5"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7.5 10.5L12 15l4.5-4.5"/><path d="M4.5 20h15"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.3-4.3"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5M12 16h.01"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+      <symbol id="i-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+      <symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 15l6-6"/><path d="M10.5 5.5l1.6-1.6a4 4 0 0 1 5.7 5.7l-1.6 1.6"/><path d="M13.5 18.5l-1.6 1.6a4 4 0 0 1-5.7-5.7l1.6-1.6"/></symbol>
+      <symbol id="i-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></symbol>
+      <symbol id="i-repeat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3.5l3 3-3 3"/><path d="M4 11V9.5a3 3 0 0 1 3-3h13"/><path d="M7 20.5l-3-3 3-3"/><path d="M20 13v1.5a3 3 0 0 1-3 3H4"/></symbol>
+    </defs>
+  </svg>
+
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#/tarefas" aria-label="DataTask — início">
+        <div class="brand-mark" aria-hidden="true">D</div>
+        <div>
+          <div class="brand-name">DataTask</div>
+          <div class="brand-caption">Automação local</div>
+        </div>
+      </a>
+
+      <nav class="nav" aria-label="Navegação principal">
+        <div class="nav-label">Workspace</div>
+        <a class="nav-link" href="#/tarefas" data-view="tarefas">
+          <svg aria-hidden="true"><use href="#i-tasks"/></svg>
+          <span>Tarefas</span>
+          <span class="nav-badge" id="navActiveCount" hidden>0</span>
+        </a>
+        <a class="nav-link" href="#/logs" data-view="logs">
+          <svg aria-hidden="true"><use href="#i-terminal"/></svg>
+          <span>Logs</span>
+        </a>
+        <a class="nav-link" href="#/config" data-view="config">
+          <svg aria-hidden="true"><use href="#i-settings"/></svg>
+          <span>Configurações</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="conn-card offline" id="connCard">
+          <span class="conn-dot" aria-hidden="true"></span>
+          <div>
+            <strong id="connTitle">Desconectado</strong>
+            <span id="connSub">Informe o token da API</span>
+          </div>
+        </div>
+        <div class="sidebar-version" id="sidebarVersion">DataTask · v—</div>
+      </div>
+    </aside>
+
+    <div class="sidebar-scrim" id="sidebarScrim" aria-hidden="true"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-button menu-toggle" id="menuToggle" type="button" aria-label="Abrir menu">
+          <svg aria-hidden="true"><use href="#i-menu"/></svg>
+        </button>
+        <div class="topbar-copy">
+          <h1 id="viewTitle">Tarefas</h1>
+          <p class="view-subtitle" id="viewSubtitle">Crie, acompanhe e execute suas automações.</p>
+        </div>
+        <div class="top-actions">
+          <button class="button outline icon-only" id="globalRefresh" type="button" title="Atualizar (r)" aria-label="Atualizar">
+            <svg aria-hidden="true"><use href="#i-refresh"/></svg>
+          </button>
+          <button class="button" id="newJobButton" type="button">
+            <svg aria-hidden="true"><use href="#i-plus"/></svg>
+            <span class="label">Nova tarefa</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- ------------------------------ Tarefas ------------------------------ -->
+      <section class="view" id="view-tarefas" aria-labelledby="viewTitle">
+        <section class="notice" id="connectBanner" hidden>
+          <svg class="notice-icon" aria-hidden="true"><use href="#i-plug"/></svg>
+          <div class="notice-body">
+            <strong>Conecte-se à API</strong>
+            <span>Use o token definido em <code>config.toml</code> para carregar suas tarefas.</span>
+          </div>
+          <form class="notice-form" id="quickConnectForm">
+            <label class="sr-only" for="quickToken">Token de acesso</label>
+            <input class="input" id="quickToken" type="password" autocomplete="current-password" placeholder="Token Bearer">
+            <button class="button" type="submit">Conectar</button>
+          </form>
+        </section>
+
+        <section class="stats" aria-label="Resumo">
+          <article class="stat" style="--i:0">
+            <div class="stat-icon tone-indigo" aria-hidden="true"><svg><use href="#i-tasks"/></svg></div>
+            <div><span class="stat-label">Total de tarefas</span><strong class="stat-value" id="statTotal">—</strong></div>
+          </article>
+          <article class="stat" style="--i:1">
+            <div class="stat-icon tone-green" aria-hidden="true"><svg><use href="#i-activity"/></svg></div>
+            <div><span class="stat-label">Ativas agora</span><strong class="stat-value" id="statActive">—</strong></div>
+          </article>
+          <article class="stat" style="--i:2">
+            <div class="stat-icon tone-amber" aria-hidden="true"><svg><use href="#i-repeat"/></svg></div>
+            <div><span class="stat-label">Agendas recorrentes</span><strong class="stat-value" id="statRecurring">—</strong></div>
+          </article>
+          <article class="stat" style="--i:3">
+            <div class="stat-icon tone-violet" aria-hidden="true"><svg><use href="#i-check"/></svg></div>
+            <div><span class="stat-label">Executadas hoje</span><strong class="stat-value" id="statToday">—</strong></div>
+          </article>
+        </section>
+
+        <div class="table-toolbar">
+          <div>
+            <h2 class="section-title">Suas tarefas</h2>
+            <p class="section-sub" id="tasksSummary">Gerencie seus comandos agendados em um só lugar.</p>
+          </div>
+          <div class="toolbar-group">
+            <div class="search-box">
+              <svg aria-hidden="true"><use href="#i-search"/></svg>
+              <input id="searchInput" type="search" placeholder="Buscar tarefa…" aria-label="Buscar tarefa">
+            </div>
+            <select class="select compact-select" id="statusFilter" aria-label="Filtrar por status">
+              <option value="todas">Todas</option>
+              <option value="ativo">Ativas</option>
+              <option value="desativo">Desativas</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th data-sort="name">Tarefa<span class="sort-ind" data-sort-ind="name"></span></th>
+                <th data-sort="schedule">Agendamento<span class="sort-ind" data-sort-ind="schedule"></span></th>
+                <th data-sort="status">Status<span class="sort-ind" data-sort-ind="status"></span></th>
+                <th data-sort="last">Última execução<span class="sort-ind" data-sort-ind="last"></span></th>
+                <th style="text-align:right">Ações</th>
+              </tr>
+            </thead>
+            <tbody id="jobsBody">
+              <tr><td class="table-message" colspan="5">Conecte-se à API para carregar as tarefas.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- -------------------------------- Logs ------------------------------- -->
+      <section class="view" id="view-logs" aria-labelledby="viewTitle">
+        <div class="logs-layout">
+          <aside class="log-list-panel" aria-label="Tarefas disponíveis para logs">
+            <div class="log-list-head">
+              <div class="search-box small">
+                <svg aria-hidden="true"><use href="#i-search"/></svg>
+                <input id="logJobSearch" type="search" placeholder="Filtrar tarefas…" aria-label="Filtrar tarefas nos logs">
+              </div>
+            </div>
+            <div class="log-jobs" id="logJobList">
+              <p class="table-message">Conecte-se para ver os logs.</p>
+            </div>
+          </aside>
+
+          <section class="log-viewer" aria-label="Visualizador de log">
+            <div class="log-viewer-head">
+              <div class="log-heading">
+                <h2 id="logTitle">Selecione uma tarefa</h2>
+                <p id="logMeta">Escolha uma tarefa à esquerda para acompanhar a saída.</p>
+              </div>
+              <div class="log-head-actions">
+                <span class="badge result-badge" id="logResult" hidden></span>
+                <span class="live-pill" id="livePill" hidden><span class="live-dot"></span>Ao vivo</span>
+              </div>
+            </div>
+            <div class="log-toolbar">
+              <div class="search-box small grow">
+                <svg aria-hidden="true"><use href="#i-search"/></svg>
+                <input id="logFilter" type="search" placeholder="Filtrar linhas do log…" aria-label="Filtrar linhas do log">
+              </div>
+              <label class="switch" title="Atualiza o log automaticamente">
+                <input type="checkbox" id="logLive" checked><span>Automático</span>
+              </label>
+              <label class="switch" title="Rola para o final a cada atualização">
+                <input type="checkbox" id="logAutoScroll" checked><span>Rolar</span>
+              </label>
+              <label class="switch" title="Quebra linhas longas">
+                <input type="checkbox" id="logWrap" checked><span>Quebrar</span>
+              </label>
+              <div class="toolbar-actions">
+                <button class="button outline icon-only small" id="logRefresh" type="button" title="Recarregar log" aria-label="Recarregar log" disabled>
+                  <svg aria-hidden="true"><use href="#i-refresh"/></svg>
+                </button>
+                <button class="button outline icon-only small" id="logDownload" type="button" title="Baixar log" aria-label="Baixar log" disabled>
+                  <svg aria-hidden="true"><use href="#i-download"/></svg>
+                </button>
+                <button class="button danger-outline icon-only small" id="logClear" type="button" title="Limpar log" aria-label="Limpar log" disabled>
+                  <svg aria-hidden="true"><use href="#i-trash"/></svg>
+                </button>
+              </div>
+            </div>
+            <pre class="log-output empty" id="logOutput" aria-live="polite">Selecione uma tarefa para visualizar o log.</pre>
+            <div class="log-footer">
+              <span id="logSize">0 B</span>
+              <span id="logUpdated">—</span>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- --------------------------- Configurações --------------------------- -->
+      <section class="view" id="view-config" aria-labelledby="viewTitle">
+        <div class="config-grid">
+          <section class="card">
+            <header class="card-head">
+              <div>
+                <h2>Conexão</h2>
+                <p>O token fica guardado apenas nesta sessão do navegador.</p>
+              </div>
+              <svg class="notice-icon" aria-hidden="true" style="color: var(--faint)"><use href="#i-plug"/></svg>
+            </header>
+            <form class="card-body" id="connectionForm">
+              <div class="field">
+                <label for="tokenInput">Token de acesso</label>
+                <input class="input" id="tokenInput" type="password" autocomplete="current-password" placeholder="Cole seu token Bearer">
+                <p class="hint">Definido em <code>api_token</code> no <code>config.toml</code> do servidor.</p>
+              </div>
+              <div class="row-actions">
+                <button class="button" type="submit">Conectar</button>
+                <button class="button ghost" type="button" id="disconnectButton">Desconectar</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="card">
+            <header class="card-head">
+              <div>
+                <h2>Preferências</h2>
+                <p>Ajustes salvos neste navegador, aplicados na hora.</p>
+              </div>
+              <svg class="notice-icon" aria-hidden="true" style="color: var(--faint)"><use href="#i-settings"/></svg>
+            </header>
+            <div class="card-body prefs">
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="prefAutoRefresh">Atualização automática (s)</label>
+                  <input class="input" id="prefAutoRefresh" type="number" min="0" max="3600" step="1">
+                  <p class="hint">0 desativa as atualizações periódicas.</p>
+                </div>
+                <div class="field">
+                  <label for="prefLogPoll">Intervalo do log ao vivo (s)</label>
+                  <input class="input" id="prefLogPoll" type="number" min="1" max="60" step="1">
+                  <p class="hint">Tempo entre leituras incrementais do log.</p>
+                </div>
+              </div>
+              <div class="pref-toggles">
+                <label class="switch"><input type="checkbox" id="prefAnimations"><span>Animações</span></label>
+                <label class="switch"><input type="checkbox" id="prefCompact"><span>Linhas compactas</span></label>
+                <label class="switch"><input type="checkbox" id="prefWrap"><span>Quebrar linhas do log</span></label>
+              </div>
+            </div>
+          </section>
+
+          <section class="card span-2">
+            <header class="card-head">
+              <div>
+                <h2>Servidor</h2>
+                <p>Informações somente leitura da instância conectada.</p>
+              </div>
+              <button class="button outline small" id="infoRefresh" type="button">
+                <svg aria-hidden="true"><use href="#i-refresh"/></svg>
+                Atualizar
+              </button>
+            </header>
+            <div class="info-grid" id="serverInfo">
+              <div class="info-empty">Conecte-se para ver as informações do servidor.</div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ------------------------------ diálogos ------------------------------- -->
+  <dialog id="jobDialog" aria-labelledby="formTitle">
+    <form id="jobForm">
+      <div class="dialog-head">
+        <div>
+          <h2 id="formTitle">Nova tarefa</h2>
+          <p id="formSubtitle">Configure o que será executado e quando.</p>
+        </div>
+        <button class="icon-button" id="closeJobDialog" type="button" aria-label="Fechar">
+          <svg aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </div>
+
+      <div class="dialog-body">
+        <div class="form-grid-2">
+          <div class="field">
+            <label for="jobName">Nome</label>
+            <input class="input" id="jobName" name="name" required maxlength="64" pattern="[A-Za-z0-9_\-]+" placeholder="ex: backup-diario">
+          </div>
+          <div class="field">
+            <label for="jobStatus">Status</label>
+            <select class="select" id="jobStatus" name="status">
+              <option value="ativo">Ativo</option>
+              <option value="desativo">Desativo</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="jobDescription">Descrição</label>
+          <input class="input" id="jobDescription" name="description" placeholder="O que esta tarefa faz?">
+        </div>
+
+        <div class="field">
+          <label for="scheduleType">Quando executar?</label>
+          <select class="select" id="scheduleType">
+            <option value="daily">Todos os dias</option>
+            <option value="times">Vários horários por dia</option>
+            <option value="interval">A cada intervalo</option>
+            <option value="weekly">Dias da semana</option>
+            <option value="monthly">Todo mês</option>
+            <option value="once">Uma vez, em uma data</option>
+            <option value="advanced">Avançado (cron)</option>
+          </select>
+          <div class="form-grid-2" id="scheduleFields"></div>
+          <p class="schedule-preview" id="schedulePreview" hidden></p>
+          <p class="schedule-help" id="scheduleHelp"></p>
+        </div>
+
+        <div class="field">
+          <label for="jobAction">Comando</label>
+          <textarea class="textarea" id="jobAction" name="action" required spellcheck="false" placeholder="Ex: python meu_script.py"></textarea>
+          <p class="hint">O comando roda no servidor e a saída é gravada no log da tarefa.</p>
+        </div>
+
+        <details class="advanced">
+          <summary>Opções avançadas</summary>
+          <div class="form-grid-2">
+            <div class="field">
+              <label for="jobWorkingDir">Diretório de trabalho</label>
+              <input class="input" id="jobWorkingDir" type="text" spellcheck="false" placeholder="/home/voce/projetos">
+              <p class="hint">Em branco usa o diretório do servidor.</p>
+            </div>
+            <div class="field">
+              <label for="jobTimeout">Tempo limite (segundos)</label>
+              <input class="input" id="jobTimeout" type="number" min="0" max="86400" step="1" placeholder="Padrão do servidor">
+              <p class="hint">Em branco usa o valor do <code>config.toml</code>.</p>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="dialog-foot">
+        <button class="button ghost" id="cancelJobButton" type="button">Cancelar</button>
+        <button class="button" id="saveJobButton" type="submit">Criar tarefa</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog" aria-labelledby="confirmTitle">
+    <div class="confirm-body">
+      <strong id="confirmTitle">Confirmar ação</strong>
+      <p id="confirmMessage"></p>
+    </div>
+    <div class="dialog-foot">
+      <button class="button ghost" id="confirmCancel" type="button">Cancelar</button>
+      <button class="button danger" id="confirmAccept" type="button">Confirmar</button>
+    </div>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>

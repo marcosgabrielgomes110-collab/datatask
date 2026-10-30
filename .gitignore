@@ -1,0 +1,15 @@
+# Credenciais locais (nunca versionar)
+/config.toml
+/config.toml.bak
+/api_token
+
+# Dados de execução
+/jobs/
+/logs/
+
+# Build
+/target/
+
+# Python (scripts auxiliares antigos)
+__pycache__/
+*.pyc
