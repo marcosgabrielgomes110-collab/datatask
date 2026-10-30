@@ -1,0 +1,30 @@
+name: Feature request
+description: Sugira uma melhoria para o DataTask
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problema ou necessidade
+      description: O que está difícil, arriscado ou faltando hoje?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposta
+      description: Descreva a solução desejada, incluindo impactos de segurança quando houver.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternativas consideradas
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Segurança
+      options:
+        - label: Esta mudança afeta autenticação, permissões, execução de comandos ou logs?
+        - label: Estou ciente de que preciso manter compatibilidade com configs antigas.

@@ -1,0 +1,55 @@
+name: Bug report
+description: Reporte um comportamento incorreto no DataTask
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Não inclua tokens, comandos com segredos ou conteúdo de `config.toml`.
+        Para vulnerabilidades, use o canal privado descrito em SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Versão ou commit
+      placeholder: "v0.1.0 / abc1234"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Como você executa
+      options:
+        - ./datatask.sh run (local)
+        - Serviço systemd
+        - cargo run
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Passos para reproduzir
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Comportamento esperado
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Comportamento atual e logs
+      description: Remova tokens, caminhos pessoais e dados sensíveis.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Ambiente
+      placeholder: "Linux, Rust 1.99, navegador X"
