@@ -2,7 +2,7 @@ name: Config
 blank_issues_enabled: false
 contact_links:
   - name: Vulnerabilidade de segurança
-    url: https://github.com/marcosgabrielgomes110-collab/datatask/security/advisories/new
+    url: https://github.com/marcosgabrielgomes110-collab/datatask/security
     about: Não abra issue pública para falhas de segurança.
   - name: Documentação
     url: https://github.com/marcosgabrielgomes110-collab/datatask#readme

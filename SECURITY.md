@@ -7,9 +7,11 @@ segurança.
 
 ## Como reportar
 
-Não abra issue pública com detalhes de vulnerabilidade. Use
-[GitHub Security Advisories](https://github.com/marcosgabrielgomes110-collab/datatask/security/advisories/new)
-para enviar o relato de forma privada. Inclua:
+Não abra issue pública com detalhes de vulnerabilidade. Use a aba
+[Security](https://github.com/marcosgabrielgomes110-collab/datatask/security)
+→ **Advisories** → **Report a vulnerability** para enviar o relato de forma
+privada. Se o botão não estiver disponível, abra um draft advisory na mesma aba
+ou contate o mantenedor pelo perfil do GitHub. Inclua:
 
 - versão/commit afetado;
 - passos de reprodução;
