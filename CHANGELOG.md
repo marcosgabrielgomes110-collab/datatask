@@ -16,6 +16,9 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 - Auditoria JSONL de operações, execuções e falhas de autenticação, com rotação
   em 5 MiB e sem token/corpo/`action`.
 - Endpoint `/readyz` com heartbeat do scheduler e jobs em execução.
+- Endpoint `/metrics` no formato Prometheus com execuções por resultado,
+  histograma de duração, jobs e saúde do scheduler; loopback sem token e
+  acesso remoto autenticado.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

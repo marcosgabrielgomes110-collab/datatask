@@ -1190,6 +1190,11 @@ cmd_status() {
     else
       warn "Readiness indisponível (scheduler ainda iniciando ou parado)"
     fi
+    if http_get "${url}/metrics" >/dev/null 2>&1; then
+      ok "Metrics check OK"
+    else
+      warn "Metrics indisponível"
+    fi
     verify_ui "$CONF_FILE"
   else
     warn "Health check falhou"

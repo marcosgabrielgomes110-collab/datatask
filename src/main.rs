@@ -11,6 +11,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -20,7 +21,10 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -126,6 +130,7 @@ struct AppState {
     guard: Arc<AccessGuard>,
     audit: Option<Arc<AuditLog>>,
     last_tick: Arc<StdMutex<Option<Instant>>>,
+    metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -134,6 +139,168 @@ impl AppState {
             audit.write(event);
         }
     }
+}
+
+const DURATION_BUCKETS: [f64; 7] = [0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0];
+
+/// Process-local counters exposed at `/metrics`. Metrics are intentionally
+/// aggregate: job names and command output never appear in the exposition.
+struct Metrics {
+    started: Instant,
+    runs_success: AtomicU64,
+    runs_error: AtomicU64,
+    runs_timeout: AtomicU64,
+    duration_count: AtomicU64,
+    duration_sum_micros: AtomicU64,
+    buckets: [AtomicU64; DURATION_BUCKETS.len()],
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            runs_success: AtomicU64::new(0),
+            runs_error: AtomicU64::new(0),
+            runs_timeout: AtomicU64::new(0),
+            duration_count: AtomicU64::new(0),
+            duration_sum_micros: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn observe(&self, outcome: &RunOutcome) {
+        match outcome.label() {
+            "success" => increment(&self.runs_success),
+            "timeout" => increment(&self.runs_timeout),
+            _ => increment(&self.runs_error),
+        }
+        let seconds = outcome.duration.as_secs_f64();
+        for (index, boundary) in DURATION_BUCKETS.iter().enumerate() {
+            if seconds <= *boundary {
+                increment(&self.buckets[index]);
+            }
+        }
+        increment(&self.duration_count);
+        self.duration_sum_micros.fetch_add(
+            outcome.duration.as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn render(
+        &self,
+        jobs_total: usize,
+        jobs_active: usize,
+        jobs_running: usize,
+        scheduler_ready: bool,
+        scheduler_lag: Option<f64>,
+    ) -> String {
+        let mut output = String::new();
+        let _ = writeln!(
+            output,
+            "# HELP datatask_up Whether the process is serving metrics."
+        );
+        let _ = writeln!(output, "# TYPE datatask_up gauge");
+        let _ = writeln!(output, "datatask_up 1");
+        let _ = writeln!(
+            output,
+            "# HELP datatask_build_info Build information for DataTask."
+        );
+        let _ = writeln!(output, "# TYPE datatask_build_info gauge");
+        let _ = writeln!(
+            output,
+            "datatask_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        );
+        let _ = writeln!(
+            output,
+            "# HELP datatask_uptime_seconds Seconds since the process started."
+        );
+        let _ = writeln!(output, "# TYPE datatask_uptime_seconds gauge");
+        let _ = writeln!(
+            output,
+            "datatask_uptime_seconds {:.3}",
+            self.started.elapsed().as_secs_f64()
+        );
+        let _ = writeln!(output, "# HELP datatask_jobs_total Configured jobs.");
+        let _ = writeln!(output, "# TYPE datatask_jobs_total gauge");
+        let _ = writeln!(output, "datatask_jobs_total {jobs_total}");
+        let _ = writeln!(output, "# HELP datatask_jobs_active Active jobs.");
+        let _ = writeln!(output, "# TYPE datatask_jobs_active gauge");
+        let _ = writeln!(output, "datatask_jobs_active {jobs_active}");
+        let _ = writeln!(
+            output,
+            "# HELP datatask_jobs_running Jobs executing right now."
+        );
+        let _ = writeln!(output, "# TYPE datatask_jobs_running gauge");
+        let _ = writeln!(output, "datatask_jobs_running {jobs_running}");
+        let _ = writeln!(
+            output,
+            "# HELP datatask_scheduler_ready Whether the scheduler heartbeat is recent."
+        );
+        let _ = writeln!(output, "# TYPE datatask_scheduler_ready gauge");
+        let _ = writeln!(
+            output,
+            "datatask_scheduler_ready {}",
+            u8::from(scheduler_ready)
+        );
+        let _ = writeln!(
+            output,
+            "# HELP datatask_scheduler_lag_seconds Time since the last scheduler tick."
+        );
+        let _ = writeln!(output, "# TYPE datatask_scheduler_lag_seconds gauge");
+        let _ = writeln!(
+            output,
+            "datatask_scheduler_lag_seconds {}",
+            scheduler_lag
+                .map(|lag| format!("{lag:.6}"))
+                .unwrap_or_else(|| "NaN".to_owned())
+        );
+        let _ = writeln!(
+            output,
+            "# HELP datatask_job_runs_total Job executions by result."
+        );
+        let _ = writeln!(output, "# TYPE datatask_job_runs_total counter");
+        for (result, counter) in [
+            ("success", &self.runs_success),
+            ("error", &self.runs_error),
+            ("timeout", &self.runs_timeout),
+        ] {
+            let _ = writeln!(
+                output,
+                "datatask_job_runs_total{{result=\"{result}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            output,
+            "# HELP datatask_job_duration_seconds Duration of job executions."
+        );
+        let _ = writeln!(output, "# TYPE datatask_job_duration_seconds histogram");
+        for (boundary, counter) in DURATION_BUCKETS.iter().zip(self.buckets.iter()) {
+            let _ = writeln!(
+                output,
+                "datatask_job_duration_seconds_bucket{{le=\"{boundary}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+        let count = self.duration_count.load(Ordering::Relaxed);
+        let _ = writeln!(
+            output,
+            "datatask_job_duration_seconds_bucket{{le=\"+Inf\"}} {count}"
+        );
+        let _ = writeln!(
+            output,
+            "datatask_job_duration_seconds_sum {:.6}",
+            self.duration_sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        );
+        let _ = writeln!(output, "datatask_job_duration_seconds_count {count}");
+        output
+    }
+}
+
+fn increment(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1179,24 +1346,26 @@ fn validate_schedule(value: &str) -> ApiResult<()> {
     Ok(())
 }
 
+fn has_valid_token(state: &AppState, headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| {
+            // Comparing digests avoids leaking token length and keeps the check
+            // constant-time even for differently sized inputs.
+            let digest = Sha256::digest(token.as_bytes());
+            bool::from(digest.as_slice().ct_eq(&state.token_digest))
+        })
+}
+
 async fn authenticate(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let ip = client_ip(&state, &request);
-    let supplied = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let authorized = supplied.is_some_and(|token| {
-        // Comparing digests avoids leaking token length and keeps the check
-        // constant-time even for differently sized inputs.
-        let digest = Sha256::digest(token.as_bytes());
-        bool::from(digest.as_slice().ct_eq(&state.token_digest))
-    });
-    if !authorized {
+    if !has_valid_token(&state, request.headers()) {
         let now = Instant::now();
         state.audit(json!({
             "ts": Local::now().to_rfc3339(),
@@ -1290,6 +1459,86 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
     }
+}
+
+async fn metrics(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let peer = peer_ip(&request);
+    if !peer.is_loopback() {
+        let ip = client_ip(&state, &request);
+        if let Err(rejection) = state.guard.check(ip, Instant::now()) {
+            let retry = rejection.retry_after();
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "request.rejected",
+                "reason": rejection.reason(),
+                "method": request.method().as_str(),
+                "path": request.uri().path(),
+                "ip": ip.to_string(),
+                "retry_after_seconds": retry_seconds(retry),
+            }));
+            return too_many_requests(retry);
+        }
+        if !has_valid_token(&state, request.headers()) {
+            let now = Instant::now();
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "auth.failure",
+                "ip": ip.to_string(),
+                "path": request.uri().path(),
+            }));
+            if let Some(lockout) = state.guard.record_failure(ip, now) {
+                state.audit(json!({
+                    "ts": Local::now().to_rfc3339(),
+                    "event": "auth.lockout",
+                    "ip": ip.to_string(),
+                    "seconds": lockout.as_secs(),
+                }));
+            }
+            let mut response = (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Unauthorized"})),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            return response;
+        }
+        state.guard.record_success(ip);
+    }
+
+    let jobs = match list_jobs(&state.config) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("Cannot collect job metrics: {}", error.1);
+            Vec::new()
+        }
+    };
+    let active = jobs.iter().filter(|job| job.status == "ativo").count();
+    let running = lock_running(&state).len();
+    let last_tick = *state
+        .last_tick
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (ready, lag) = scheduler_readiness(
+        last_tick,
+        Duration::from_secs(state.config.poll_interval_seconds),
+        Instant::now(),
+    );
+    let body = state
+        .metrics
+        .render(jobs.len(), active, running, ready, lag);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn dashboard() -> impl IntoResponse {
@@ -1527,6 +1776,7 @@ async fn run_job(state: Arc<AppState>, name: &str, origin: RunOrigin) -> ApiResu
 
 /// Persists the result of the last run so clients can show a status badge.
 async fn record_outcome(state: &AppState, name: &str, outcome: &RunOutcome) {
+    state.metrics.observe(outcome);
     let _guard = state.repository_lock.lock().await;
     let Ok(mut job) = read_job(&state.config, name) else {
         return;
@@ -2155,6 +2405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         guard,
         audit,
         last_tick: Arc::new(StdMutex::new(None)),
+        metrics: Arc::new(Metrics::new()),
     });
     let scheduler_handle = tokio::spawn(scheduler(state.clone()));
 
@@ -2177,6 +2428,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state.clone());
     let readiness: Router = Router::new()
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .with_state(state.clone());
     let app: Router = Router::new()
         .route("/", get(dashboard))
@@ -2335,6 +2587,48 @@ mod tests {
         assert!(!scheduler_readiness(Some(now - Duration::from_secs(9)), interval, now).0);
         assert_eq!(job_from_path("/api/jobs/task/logs"), Some("task"));
         assert_eq!(job_from_path("/api/jobs"), None);
+    }
+
+    #[test]
+    fn renders_prometheus_metrics() {
+        let metrics = Metrics::new();
+        for outcome in [
+            RunOutcome {
+                exit_code: Some(0),
+                timed_out: false,
+                duration: Duration::from_millis(50),
+                error: None,
+            },
+            RunOutcome {
+                exit_code: Some(2),
+                timed_out: false,
+                duration: Duration::from_millis(1_500),
+                error: None,
+            },
+            RunOutcome {
+                exit_code: None,
+                timed_out: true,
+                duration: Duration::from_secs(10),
+                error: None,
+            },
+        ] {
+            metrics.observe(&outcome);
+        }
+        let text = metrics.render(3, 2, 1, true, Some(0.25));
+        assert!(text.contains("datatask_job_runs_total{result=\"success\"} 1"));
+        assert!(text.contains("datatask_job_runs_total{result=\"error\"} 1"));
+        assert!(text.contains("datatask_job_runs_total{result=\"timeout\"} 1"));
+        assert!(text.contains("datatask_job_duration_seconds_bucket{le=\"0.1\"} 1"));
+        assert!(text.contains("datatask_job_duration_seconds_bucket{le=\"1\"} 1"));
+        assert!(text.contains("datatask_job_duration_seconds_bucket{le=\"5\"} 2"));
+        assert!(text.contains("datatask_job_duration_seconds_bucket{le=\"15\"} 3"));
+        assert!(text.contains("datatask_job_duration_seconds_bucket{le=\"+Inf\"} 3"));
+        assert!(text.contains("datatask_job_duration_seconds_count 3"));
+        assert!(text.contains("datatask_jobs_total 3"));
+        assert!(text.contains("datatask_jobs_active 2"));
+        assert!(text.contains("datatask_jobs_running 1"));
+        assert!(text.contains("datatask_scheduler_ready 1"));
+        assert!(text.contains("datatask_scheduler_lag_seconds 0.250000"));
     }
 
     #[test]

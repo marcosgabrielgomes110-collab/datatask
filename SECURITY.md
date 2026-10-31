@@ -43,5 +43,7 @@ advisory com crédito, se desejado.
 - A auditoria em `audit.jsonl` registra IP, método, path, status, job e duração.
   Ela não grava token, corpo de request nem `action`, mas o path pode revelar
   nomes de jobs; proteja o arquivo como dado sensível.
+- `/metrics` é anônimo apenas para loopback. Scrapes remotos exigem Bearer e
+  expõem somente agregados, sem nomes de jobs, comandos ou saídas.
 - Se você encontrar token em log, histórico de shell, issue ou commit, rotacione
   imediatamente e remova o segredo do histórico.

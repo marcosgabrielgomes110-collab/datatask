@@ -256,6 +256,8 @@ a config e os dados existentes.
   `X-Forwarded-Proto: https` recebem `426` e HSTS no modo proxy.
 - `/readyz` informa se o scheduler está ativo (lag do último tick) e quantos
   jobs estão em execução; `/health` continua sendo apenas liveness.
+- `/metrics` só é anônimo para loopback; acesso remoto exige Bearer e expõe
+  apenas agregados (sem nomes de jobs, comandos ou saídas).
 - Cada comando roda em seu próprio grupo de processos; ao estourar o timeout,
   o grupo inteiro é encerrado (não apenas o `/bin/sh`).
 - O desligamento (SIGTERM/Ctrl+C) para o agendador e aguarda até 10 s pelos
@@ -296,6 +298,7 @@ autenticação Bearer, com o valor configurado em `api_token`.
 
 - `GET /health` — liveness do processo
 - `GET /readyz` — prontidão: scheduler ativo, lag do último tick e jobs em execução
+- `GET /metrics` — métricas Prometheus; loopback não exige token, acesso remoto exige Bearer
 - `GET /api/info` — versão, diretórios, intervalos, contagens e jobs em execução
 - `GET /api/jobs` — listar jobs
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,
@@ -329,6 +332,39 @@ curl -X POST http://127.0.0.1:8080/api/jobs \
 
 Os campos `action` executam comandos pelo shell do sistema. Crie ou altere jobs
 somente por meio de clientes confiáveis e mantenha o token secreto.
+
+## Métricas
+
+`GET /metrics` expõe o formato de texto do Prometheus:
+
+```bash
+curl -s http://127.0.0.1:8080/metrics
+```
+
+```yaml
+scrape_configs:
+  - job_name: datatask
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+Acesso:
+
+- conexões de loopback não exigem token e não entram no rate limit;
+- conexões remotas exigem `Authorization: Bearer <token>` e usam o mesmo rate
+  limit/bloqueio por IP de `/api`;
+- o endpoint continua sujeito ao HTTPS guard quando
+  `tls_terminated_by_proxy` está ativo.
+
+Métricas expostas:
+
+- `datatask_up`, `datatask_build_info{version}`, `datatask_uptime_seconds`
+- `datatask_jobs_total`, `datatask_jobs_active`, `datatask_jobs_running`
+- `datatask_scheduler_ready`, `datatask_scheduler_lag_seconds`
+- `datatask_job_runs_total{result="success|error|timeout"}`
+- `datatask_job_duration_seconds` (histograma com buckets de 0,1 s a 300 s)
+
+As métricas são agregadas: nomes de jobs, comandos e saídas não aparecem nelas.
 
 ## Desenvolvimento
 
