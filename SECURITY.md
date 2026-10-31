@@ -26,18 +26,20 @@ advisory com crédito, se desejado.
 - **Token da API = execução de comandos.** Qualquer pessoa com o token pode
   criar jobs e rodar comandos como o usuário do serviço.
 - O servidor fala HTTP puro. Bind fora de loopback é recusado no boot, a menos
-  que `tls_terminated_by_proxy = true` indique um proxy TLS na frente. Mesmo
-  assim, restrinja a porta ao IP do proxy no firewall.
-- Com `tls_terminated_by_proxy = true`, peers não-loopback precisam enviar
-  `X-Forwarded-Proto: https` (exceto `/health` e `/readyz`); isso não substitui
-  firewall, pois o header é falsificável por quem alcança a porta diretamente.
+  que `tls_terminated_by_proxy = true` e `trusted_proxy_ips` listem o(s) proxy(s).
+  Mesmo assim, restrinja a porta aos IPs do proxy no firewall.
+- Com `tls_terminated_by_proxy = true`, peers não-loopback fora da allowlist
+  recebem `403`; os confiáveis precisam enviar `X-Forwarded-Proto: https`
+  (exceto `/health` e `/readyz`). O header é falsificável, por isso a allowlist
+  e o firewall são obrigatórios.
 - O painel guarda o token em `sessionStorage`; qualquer XSS teria acesso a ele.
   A aplicação aplica CSP e escapa conteúdo, mas trate o navegador como confiável.
 - Jobs e logs podem conter segredos. Mantenha `jobs/` e `logs/` em `700`/`600`
   e não coloque credenciais em `action`.
-- O rate limit é por IP. Com `trust_proxy_headers = true`, o servidor confia no
-  primeiro IP de `X-Forwarded-For`; só habilite atrás de um proxy confiável,
-  caso contrário o cliente pode falsificar o IP e escapar do limite.
+- O rate limit é por IP. Com `trust_proxy_headers = true`, o servidor só usa o
+  primeiro IP de `X-Forwarded-For` quando a conexão vem de loopback ou de um IP
+  em `trusted_proxy_ips`; caso contrário, usa o IP real do peer. Mantenha a
+  allowlist e o firewall corretos para não confiar em headers de terceiros.
 - A auditoria em `audit.jsonl` registra IP, método, path, status, job e duração.
   Ela não grava token, corpo de request nem `action`, mas o path pode revelar
   nomes de jobs; proteja o arquivo como dado sensível.

@@ -271,7 +271,6 @@ expand_path() {
   esac
 }
 
-# Lê uma chave simples do TOML (sem TOML parser completo).
 config_get() {
   local file="$1" key="$2" value
   [[ -f "$file" ]] || return 0
@@ -279,6 +278,15 @@ config_get() {
   value="${value%%#*}"
   value="${value//\"/}"
   value="${value//\'/}"
+  printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# Mantém aspas/estrutura (arrays TOML), ao contrário de config_get.
+config_get_raw() {
+  local file="$1" key="$2" value
+  [[ -f "$file" ]] || return 0
+  value="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" | tail -n1 | cut -d= -f2- || true)"
+  value="${value%%#*}"
   printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
@@ -378,6 +386,7 @@ auth_failure_limit = $auth_limit
 auth_failure_window_seconds = $auth_window
 auth_lockout_seconds = $auth_lockout
 tls_terminated_by_proxy = false
+trusted_proxy_ips = []
 trust_proxy_headers = false
 audit_log_file = "logs/audit.jsonl"
 EOF
@@ -553,6 +562,7 @@ cmd_setup() {
   local cur_bind cur_port cur_jobs cur_logs cur_poll cur_timeout cur_token cur_token_file
   local cur_max_jobs cur_log_max cur_rate cur_auth_limit cur_auth_window cur_auth_lockout
   local prev_tls prev_trust prev_audit prev_audit_set=0
+  local prev_trusted prev_trusted_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -572,6 +582,10 @@ cmd_setup() {
   if grep -qE '^[[:space:]]*audit_log_file[[:space:]]*=' "$conf"; then
     prev_audit="$(config_get "$conf" audit_log_file)"
     prev_audit_set=1
+  fi
+  if grep -qE '^[[:space:]]*trusted_proxy_ips[[:space:]]*=' "$conf"; then
+    prev_trusted="$(config_get_raw "$conf" trusted_proxy_ips)"
+    prev_trusted_set=1
   fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
@@ -617,7 +631,10 @@ cmd_setup() {
     if [[ "$prev_tls" != "true" ]]; then
       warn "Bind em '$bind' sem tls_terminated_by_proxy: o servidor vai recusar iniciar."
       warn "Use 127.0.0.1 atrás de um proxy TLS ou defina tls_terminated_by_proxy = true (com firewall)."
-    elif [[ "$prev_trust" != "true" ]]; then
+    elif [[ "$prev_trusted_set" -ne 1 || -z "$prev_trusted" || "$prev_trusted" == "[]" ]]; then
+      warn "Defina trusted_proxy_ips com o(s) IP(s) do proxy; sem isso o servidor vai recusar iniciar."
+    fi
+    if [[ "$prev_tls" == "true" && "$prev_trust" != "true" ]]; then
       warn "Considere trust_proxy_headers = true para o rate limit distinguir clientes atrás do proxy."
     fi
   fi
@@ -629,6 +646,7 @@ cmd_setup() {
   # Preserva opções avançadas que não têm prompt no setup.
   [[ -n "$prev_tls" ]] && config_set_raw "$conf" tls_terminated_by_proxy "$prev_tls"
   [[ -n "$prev_trust" ]] && config_set_raw "$conf" trust_proxy_headers "$prev_trust"
+  [[ "$prev_trusted_set" -eq 1 ]] && config_set_raw "$conf" trusted_proxy_ips "$prev_trusted"
   [[ "$prev_audit_set" -eq 1 ]] && config_set_string "$conf" audit_log_file "$prev_audit"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
@@ -1002,11 +1020,17 @@ prepare_service_files() {
   jobs="${jobs:-$JOBS_DIR}"
   logs="${logs:-$LOGS_DIR}"
 
-  local bind_addr tls_proxy
+  local bind_addr tls_proxy trusted_raw
   bind_addr="$(config_get "$CONF_FILE" bind_address)"
   tls_proxy="$(config_get "$CONF_FILE" tls_terminated_by_proxy)"
+  trusted_raw="$(config_get_raw "$CONF_FILE" trusted_proxy_ips)"
   if [[ "$bind_addr" != "127.0.0.1" && "$bind_addr" != "::1" && "$bind_addr" != "localhost" && "$tls_proxy" != "true" ]]; then
     die "bind_address='${bind_addr}' exige TLS. Use 127.0.0.1 atrás de um proxy TLS ou defina tls_terminated_by_proxy = true em $CONF_FILE (somente com firewall restringindo a porta ao proxy)."
+  fi
+  if [[ "$bind_addr" != "127.0.0.1" && "$bind_addr" != "::1" && "$bind_addr" != "localhost" && "$tls_proxy" == "true" ]]; then
+    if [[ -z "$trusted_raw" || "$trusted_raw" == "[]" ]]; then
+      die "bind_address='${bind_addr}' com tls_terminated_by_proxy exige trusted_proxy_ips = [\"<ip-do-proxy>\"] em $CONF_FILE."
+    fi
   fi
 
   install -d -m 700 "$DATA_DIR" "$jobs" "$logs"

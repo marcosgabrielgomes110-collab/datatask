@@ -47,6 +47,10 @@ struct Config {
     /// process. Required when `bind_address` is not loopback.
     #[serde(default)]
     tls_terminated_by_proxy: bool,
+    /// Addresses allowed to supply `X-Forwarded-For`/`X-Forwarded-Proto`.
+    /// Loopback is always trusted; remote proxies must be listed explicitly.
+    #[serde(default)]
+    trusted_proxy_ips: Vec<IpAddr>,
     #[serde(default)]
     api_token: Option<String>,
     #[serde(default)]
@@ -329,8 +333,22 @@ impl AuditLog {
     }
 }
 
+fn peer_ip(request: &Request<Body>) -> IpAddr {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn is_trusted_proxy(peer: IpAddr, trusted: &[IpAddr]) -> bool {
+    peer.is_loopback() || trusted.contains(&peer)
+}
+
 fn client_ip(state: &AppState, request: &Request<Body>) -> IpAddr {
+    let peer = peer_ip(request);
     if state.config.trust_proxy_headers
+        && is_trusted_proxy(peer, &state.config.trusted_proxy_ips)
         && let Some(value) = request
             .headers()
             .get("x-forwarded-for")
@@ -342,11 +360,7 @@ fn client_ip(state: &AppState, request: &Request<Body>) -> IpAddr {
     {
         return ip;
     }
-    request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|connect_info| connect_info.0.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    peer
 }
 
 fn job_from_path(path: &str) -> Option<&str> {
@@ -372,13 +386,31 @@ fn too_many_requests(retry: Duration) -> Response {
     response
 }
 
-fn https_guard_rejects(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpsDecision {
+    Allow,
+    UntrustedProxy,
+    UpgradeRequired,
+}
+
+fn https_decision(
     tls_proxy: bool,
     path: &str,
     peer_is_loopback: bool,
+    peer_is_trusted: bool,
     forwarded_https: bool,
-) -> bool {
-    tls_proxy && !peer_is_loopback && !matches!(path, "/health" | "/readyz") && !forwarded_https
+) -> HttpsDecision {
+    if !tls_proxy || matches!(path, "/health" | "/readyz") || peer_is_loopback {
+        return HttpsDecision::Allow;
+    }
+    if !peer_is_trusted {
+        return HttpsDecision::UntrustedProxy;
+    }
+    if forwarded_https {
+        HttpsDecision::Allow
+    } else {
+        HttpsDecision::UpgradeRequired
+    }
 }
 
 async fn https_guard(
@@ -390,32 +422,57 @@ async fn https_guard(
         return next.run(request).await;
     }
     let path = request.uri().path().to_owned();
-    let peer_is_loopback = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|connect_info| connect_info.0.ip().is_loopback())
-        .unwrap_or(true);
+    let peer = peer_ip(&request);
+    let trusted = is_trusted_proxy(peer, &state.config.trusted_proxy_ips);
     let forwarded_https = request
         .headers()
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"));
-    if https_guard_rejects(
+    match https_decision(
         state.config.tls_terminated_by_proxy,
         &path,
-        peer_is_loopback,
+        peer.is_loopback(),
+        trusted,
         forwarded_https,
     ) {
-        return (
-            StatusCode::UPGRADE_REQUIRED,
-            Json(json!({
-                "error": "HTTPS required. Access this service through the configured TLS proxy."
-            })),
-        )
-            .into_response();
+        HttpsDecision::Allow => next.run(request).await,
+        HttpsDecision::UntrustedProxy => {
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "request.rejected",
+                "reason": "untrusted_proxy",
+                "method": request.method().as_str(),
+                "path": path,
+                "ip": peer.to_string(),
+            }));
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "Requests must come through a trusted TLS proxy."
+                })),
+            )
+                .into_response()
+        }
+        HttpsDecision::UpgradeRequired => {
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "request.rejected",
+                "reason": "https_required",
+                "method": request.method().as_str(),
+                "path": path,
+                "ip": peer.to_string(),
+            }));
+            (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(json!({
+                    "error": "HTTPS required. Access this service through the configured TLS proxy."
+                })),
+            )
+                .into_response()
+        }
     }
-    next.run(request).await
 }
 
 async fn api_guard(
@@ -756,6 +813,20 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
             "bind_address '{}' would expose plaintext HTTP. Keep bind_address = \"127.0.0.1\" behind a TLS reverse proxy, or set tls_terminated_by_proxy = true only when the port is reachable exclusively by that proxy.",
             config.bind_address
         ));
+    }
+    if config.tls_terminated_by_proxy
+        && !bind_is_loopback(&config.bind_address)
+        && config.trusted_proxy_ips.is_empty()
+    {
+        return Err(
+            "tls_terminated_by_proxy with a non-loopback bind requires trusted_proxy_ips with the proxy address(es) (for example [\"10.0.0.10\"])."
+                .to_owned(),
+        );
+    }
+    if !config.tls_terminated_by_proxy && !config.trusted_proxy_ips.is_empty() {
+        eprintln!(
+            "warning: trusted_proxy_ips is ignored because tls_terminated_by_proxy is false."
+        );
     }
     if config.tls_terminated_by_proxy
         && !bind_is_loopback(&config.bind_address)
@@ -1826,6 +1897,12 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "port": state.config.port,
         "tls_terminated_by_proxy": state.config.tls_terminated_by_proxy,
         "trust_proxy_headers": state.config.trust_proxy_headers,
+        "trusted_proxy_ips": state
+            .config
+            .trusted_proxy_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
         "poll_interval_seconds": state.config.poll_interval_seconds,
         "command_timeout_seconds": state.config.command_timeout_seconds,
         "max_concurrent_jobs": state.config.max_concurrent_jobs,
@@ -2270,11 +2347,39 @@ mod tests {
         assert!(!bind_is_loopback("::"));
         assert!(!bind_is_loopback("192.168.0.10"));
 
-        assert!(!https_guard_rejects(false, "/api/jobs", false, false));
-        assert!(!https_guard_rejects(true, "/health", false, false));
-        assert!(!https_guard_rejects(true, "/readyz", false, false));
-        assert!(!https_guard_rejects(true, "/api/jobs", true, false));
-        assert!(!https_guard_rejects(true, "/api/jobs", false, true));
-        assert!(https_guard_rejects(true, "/api/jobs", false, false));
+        let proxy: IpAddr = "10.0.0.10".parse().unwrap();
+        let other: IpAddr = "10.0.0.11".parse().unwrap();
+        assert!(is_trusted_proxy(IpAddr::V4(Ipv4Addr::LOCALHOST), &[proxy]));
+        assert!(is_trusted_proxy(proxy, &[proxy]));
+        assert!(!is_trusted_proxy(other, &[proxy]));
+
+        assert_eq!(
+            https_decision(false, "/api/jobs", false, false, false),
+            HttpsDecision::Allow
+        );
+        assert_eq!(
+            https_decision(true, "/health", false, false, false),
+            HttpsDecision::Allow
+        );
+        assert_eq!(
+            https_decision(true, "/readyz", false, false, false),
+            HttpsDecision::Allow
+        );
+        assert_eq!(
+            https_decision(true, "/api/jobs", true, true, false),
+            HttpsDecision::Allow
+        );
+        assert_eq!(
+            https_decision(true, "/api/jobs", false, false, true),
+            HttpsDecision::UntrustedProxy
+        );
+        assert_eq!(
+            https_decision(true, "/api/jobs", false, true, false),
+            HttpsDecision::UpgradeRequired
+        );
+        assert_eq!(
+            https_decision(true, "/api/jobs", false, true, true),
+            HttpsDecision::Allow
+        );
     }
 }

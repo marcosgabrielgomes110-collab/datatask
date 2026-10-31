@@ -13,6 +13,8 @@ bind_address = "127.0.0.1"
 port = 8080
 # Necessário apenas se bind_address não for loopback e houver proxy TLS na frente.
 tls_terminated_by_proxy = false
+# IPs de proxies remotos autorizados a enviar X-Forwarded-*; loopback é sempre confiável.
+trusted_proxy_ips = []
 # Recomendado: token em arquivo separado, com permissão 600.
 api_token_file = "/etc/datatask/api_token"
 # Alternativa (legado): token direto na config.
@@ -90,23 +92,28 @@ server {
 }
 ```
 
-Se o proxy estiver em **outro host**, o bind precisa ser acessível a ele:
+Se o proxy estiver em **outro host**, o bind precisa ser acessível a ele e o IP
+do proxy precisa estar na allowlist:
 
 ```toml
 bind_address = "0.0.0.0"
 tls_terminated_by_proxy = true
+trusted_proxy_ips = ["10.0.0.10"]
 trust_proxy_headers = true
 ```
 
 Nesse caso:
 
-- o firewall deve permitir a porta **somente** para o IP do proxy;
+- o firewall deve permitir a porta **somente** para os IPs de `trusted_proxy_ips`;
 - `tls_terminated_by_proxy = true` é uma afirmação explícita, não detecta TLS;
-- requests de peers não-loopback sem `X-Forwarded-Proto: https` recebem `426`
+- peers não-loopback fora da allowlist recebem `403`;
+- peers confiáveis sem `X-Forwarded-Proto: https` recebem `426`
   (exceto `/health` e `/readyz`);
+- `X-Forwarded-For` só é aceito quando o peer é loopback ou está em
+  `trusted_proxy_ips`; caso contrário o IP real da conexão é usado no rate limit;
 - o servidor envia `Strict-Transport-Security` quando o modo proxy TLS está ativo;
-- `trust_proxy_headers` só deve ser habilitado atrás de um proxy confiável,
-  pois `X-Forwarded-For` pode ser falsificado por quem alcança a porta direto.
+- loopback é sempre confiável, então um proxy no mesmo host não precisa de
+  allowlist (e o bind deve continuar em `127.0.0.1`).
 
 ## Executar
 
@@ -244,8 +251,9 @@ a config e os dados existentes.
   `/api`.
 - Rate limit por IP e bloqueio temporário após falhas de autenticação; eventos
   relevantes vão para o audit JSONL, sem token, corpo ou `action`.
-- Fora de loopback, o boot exige `tls_terminated_by_proxy = true`; o modo proxy
-  rejeita requests não-loopback sem `X-Forwarded-Proto: https` e envia HSTS.
+- Fora de loopback, o boot exige `tls_terminated_by_proxy = true` e
+  `trusted_proxy_ips`; requests de proxies não listados recebem `403`, e sem
+  `X-Forwarded-Proto: https` recebem `426` e HSTS no modo proxy.
 - `/readyz` informa se o scheduler está ativo (lag do último tick) e quantos
   jobs estão em execução; `/health` continua sendo apenas liveness.
 - Cada comando roda em seu próprio grupo de processos; ao estourar o timeout,
