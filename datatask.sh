@@ -391,6 +391,7 @@ tls_terminated_by_proxy = false
 trusted_proxy_ips = []
 trust_proxy_headers = false
 audit_log_file = "logs/audit.jsonl"
+history_file = "logs/history.jsonl"
 EOF
   umask "$old_umask"
 }
@@ -564,6 +565,7 @@ cmd_setup() {
   local cur_bind cur_port cur_jobs cur_logs cur_poll cur_timeout cur_token cur_token_file
   local cur_max_jobs cur_log_max cur_rate cur_auth_limit cur_auth_window cur_auth_lockout cur_notify
   local prev_tls prev_trust prev_audit prev_audit_set=0
+  local prev_history prev_history_set=0
   local prev_trusted prev_trusted_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
@@ -589,6 +591,10 @@ cmd_setup() {
   if grep -qE '^[[:space:]]*trusted_proxy_ips[[:space:]]*=' "$conf"; then
     prev_trusted="$(config_get_raw "$conf" trusted_proxy_ips)"
     prev_trusted_set=1
+  fi
+  if grep -qE '^[[:space:]]*history_file[[:space:]]*=' "$conf"; then
+    prev_history="$(config_get "$conf" history_file)"
+    prev_history_set=1
   fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
@@ -652,6 +658,7 @@ cmd_setup() {
   [[ -n "$prev_trust" ]] && config_set_raw "$conf" trust_proxy_headers "$prev_trust"
   [[ "$prev_trusted_set" -eq 1 ]] && config_set_raw "$conf" trusted_proxy_ips "$prev_trusted"
   [[ "$prev_audit_set" -eq 1 ]] && config_set_string "$conf" audit_log_file "$prev_audit"
+  [[ "$prev_history_set" -eq 1 ]] && config_set_string "$conf" history_file "$prev_history"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then

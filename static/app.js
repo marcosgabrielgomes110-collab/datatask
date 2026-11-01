@@ -16,6 +16,7 @@
   const VIEW_META = {
     tarefas: { title: "Tarefas", subtitle: "Crie, acompanhe e execute suas automações." },
     logs: { title: "Logs de execução", subtitle: "Acompanhe a saída dos comandos em tempo real." },
+    historico: { title: "Histórico", subtitle: "Tentativas registradas, com filtros e paginação." },
     config: { title: "Configurações", subtitle: "Conexão, preferências e informações do servidor." }
   };
 
@@ -70,6 +71,14 @@
     logOutput: $("#logOutput"),
     logSize: $("#logSize"),
     logUpdated: $("#logUpdated"),
+    historyJobFilter: $("#historyJobFilter"),
+    historyResultFilter: $("#historyResultFilter"),
+    historyRefresh: $("#historyRefresh"),
+    historyBody: $("#historyBody"),
+    historySummary: $("#historySummary"),
+    historyPage: $("#historyPage"),
+    historyPrev: $("#historyPrev"),
+    historyNext: $("#historyNext"),
     tokenInput: $("#tokenInput"),
     connectionForm: $("#connectionForm"),
     disconnectButton: $("#disconnectButton"),
@@ -124,6 +133,15 @@
       live: true,
       autoScroll: true,
       filter: ""
+    },
+    history: {
+      items: [],
+      total: 0,
+      offset: 0,
+      limit: 25,
+      job: "",
+      result: "",
+      enabled: true
     },
     timers: { auto: null, log: null, watch: null }
   };
@@ -471,6 +489,8 @@
     renderStats();
     renderTasks();
     renderLogJobList();
+    renderHistoryJobFilter();
+    renderHistory();
     renderServerInfo();
     watchRunning();
   }
@@ -651,6 +671,95 @@
   }
 
   /* ---------------------------------------------------------------------- */
+  /* Histórico                                                              */
+  /* ---------------------------------------------------------------------- */
+
+  function formatHistoryTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value ?? "—");
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+  }
+
+  function formatDurationMs(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms < 0) return "—";
+    if (ms < 1000) return `${Math.round(ms)} ms`;
+    const seconds = ms / 1000;
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 2 : 1)} s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${Math.round(seconds % 60)}s`;
+  }
+
+  function renderHistoryJobFilter() {
+    const current = state.history.job;
+    const options = [`<option value="">Todas as tarefas</option>`]
+      .concat(state.jobs.map(job => `<option value="${escapeHtml(job.name)}">${escapeHtml(job.name)}</option>`));
+    el.historyJobFilter.innerHTML = options.join("");
+    if (current && state.jobs.some(job => job.name === current)) {
+      el.historyJobFilter.value = current;
+    } else if (current) {
+      state.history.job = "";
+    }
+  }
+
+  function renderHistory() {
+    const { items, total, offset, limit, enabled } = state.history;
+    el.historySummary.textContent = enabled
+      ? `${total} tentativa${total === 1 ? "" : "s"} registrada${total === 1 ? "" : "s"}.`
+      : "Histórico desativado na configuração do servidor.";
+    if (!items.length) {
+      const message = !getToken()
+        ? "Conecte-se à API para carregar o histórico."
+        : enabled ? "Nenhuma execução encontrada para os filtros atuais." : "Histórico persistente desativado.";
+      el.historyBody.innerHTML = `<tr><td class="table-message" colspan="7">${escapeHtml(message)}</td></tr>`;
+    } else {
+      el.historyBody.innerHTML = items.map((record, index) => `
+        <tr style="--i:${index}">
+          <td>${escapeHtml(formatHistoryTime(record.timestamp))}</td>
+          <td><code>${escapeHtml(record.job)}</code></td>
+          <td>${resultBadge({ last_result: record.result })}</td>
+          <td>${record.attempt}/${record.max_attempts}</td>
+          <td>${escapeHtml(formatDurationMs(record.duration_ms))}</td>
+          <td>${record.exit_code ?? "—"}</td>
+          <td>${record.origin === "scheduler" ? "agenda" : "manual"}</td>
+        </tr>`).join("");
+    }
+    const start = items.length ? offset + 1 : 0;
+    const end = Math.min(offset + items.length, total);
+    el.historyPage.textContent = `${start}–${end} de ${total}`;
+    el.historyPrev.disabled = offset <= 0;
+    el.historyNext.disabled = offset + limit >= total;
+  }
+
+  async function loadHistory({ reset = false, silent = true } = {}) {
+    if (!getToken()) {
+      state.history.items = [];
+      state.history.total = 0;
+      renderHistory();
+      return;
+    }
+    if (reset) state.history.offset = 0;
+    const params = new URLSearchParams({
+      limit: String(state.history.limit),
+      offset: String(state.history.offset)
+    });
+    if (state.history.job) params.set("job", state.history.job);
+    if (state.history.result) params.set("result", state.history.result);
+    try {
+      const data = await api(`/api/history?${params.toString()}`);
+      state.history.items = Array.isArray(data.items) ? data.items : [];
+      state.history.total = Number(data.total) || 0;
+      state.history.limit = Number(data.limit) || state.history.limit;
+      state.history.offset = Number(data.offset) || 0;
+      state.history.enabled = data.enabled !== false;
+      renderHistory();
+    } catch (error) {
+      if (!silent) toast(error.message, "error");
+      renderHistory();
+    }
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* Navegação                                                              */
   /* ---------------------------------------------------------------------- */
 
@@ -680,6 +789,10 @@
       stopLogPolling();
     }
     if (name === "config") renderServerInfo();
+    if (name === "historico") {
+      renderHistoryJobFilter();
+      loadHistory({ reset: true }).catch(() => { /* mantém a última visão */ });
+    }
   }
 
   function openNav() {
@@ -1483,6 +1596,9 @@
     state.running = new Set();
     state.info = null;
     state.loadedOnce = false;
+    state.history.items = [];
+    state.history.total = 0;
+    state.history.offset = 0;
     clearLogSelection();
     setConnection("offline", "Informe o token da API");
     el.tokenInput.value = "";
@@ -1604,6 +1720,26 @@
     el.prefCompact.addEventListener("change", () => updatePrefs({ compact: el.prefCompact.checked }));
     el.prefWrap.addEventListener("change", () => updatePrefs({ wrapLogs: el.prefWrap.checked }));
 
+    el.historyJobFilter.addEventListener("change", () => {
+      state.history.job = el.historyJobFilter.value;
+      loadHistory({ reset: true }).catch(error => toast(error.message, "error"));
+    });
+    el.historyResultFilter.addEventListener("change", () => {
+      state.history.result = el.historyResultFilter.value;
+      loadHistory({ reset: true }).catch(error => toast(error.message, "error"));
+    });
+    el.historyRefresh.addEventListener("click", () => {
+      loadHistory({ reset: true, silent: false }).catch(error => toast(error.message, "error"));
+    });
+    el.historyPrev.addEventListener("click", () => {
+      state.history.offset = Math.max(0, state.history.offset - state.history.limit);
+      loadHistory().catch(error => toast(error.message, "error"));
+    });
+    el.historyNext.addEventListener("click", () => {
+      state.history.offset += state.history.limit;
+      loadHistory().catch(error => toast(error.message, "error"));
+    });
+
     el.jobForm.addEventListener("submit", saveJob);
     el.closeJobDialog.addEventListener("click", () => el.jobDialog.close());
     el.cancelJobButton.addEventListener("click", () => el.jobDialog.close());
@@ -1631,6 +1767,7 @@
     try {
       await refreshData({ silent: true });
       if (state.view === "logs" && state.logs.job) await loadLogFull();
+      if (state.view === "historico") await loadHistory({ silent: true });
       toast("Dados atualizados.", "success");
     } catch (error) {
       toast(error.message, "error");

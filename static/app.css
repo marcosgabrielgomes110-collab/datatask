@@ -588,6 +588,16 @@ select.select {
 
 .select.compact-select { width: 132px; min-height: 38px; }
 
+.history-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
 /* ---------------------------------- table --------------------------------- */
 
 .table-wrap {

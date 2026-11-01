@@ -86,6 +86,9 @@ struct Config {
     /// JSONL audit trail. Empty string disables it; omitted defaults to `<logs_dir>/audit.jsonl`.
     #[serde(default)]
     audit_log_file: Option<PathBuf>,
+    /// JSONL execution history. Empty string disables it; omitted defaults to `<logs_dir>/history.jsonl`.
+    #[serde(default)]
+    history_file: Option<PathBuf>,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -139,6 +142,7 @@ struct AppState {
     token_digest: [u8; 32],
     guard: Arc<AccessGuard>,
     audit: Option<Arc<AuditLog>>,
+    history: Option<Arc<HistoryLog>>,
     last_tick: Arc<StdMutex<Option<Instant>>>,
     metrics: Arc<Metrics>,
     http_client: reqwest::Client,
@@ -148,6 +152,12 @@ impl AppState {
     fn audit(&self, event: Value) {
         if let Some(audit) = &self.audit {
             audit.write(event);
+        }
+    }
+
+    fn record_history(&self, record: RunRecord) {
+        if let Some(history) = &self.history {
+            history.append(&record);
         }
     }
 }
@@ -521,6 +531,125 @@ fn peer_ip(request: &Request<Body>) -> IpAddr {
 
 fn is_trusted_proxy(peer: IpAddr, trusted: &[IpAddr]) -> bool {
     peer.is_loopback() || trusted.contains(&peer)
+}
+
+const HISTORY_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RunRecord {
+    timestamp: String,
+    job: String,
+    origin: String,
+    attempt: u32,
+    max_attempts: u32,
+    result: String,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    timed_out: bool,
+}
+
+/// Append-only JSONL history for completed run attempts.
+struct HistoryLog {
+    path: PathBuf,
+    lock: StdMutex<()>,
+}
+
+impl HistoryLog {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            lock: StdMutex::new(()),
+        }
+    }
+
+    fn append(&self, record: &RunRecord) {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Cannot create history directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+        if let Ok(metadata) = fs::metadata(&self.path)
+            && metadata.len() >= HISTORY_MAX_BYTES
+        {
+            let mut rotated = self.path.as_os_str().to_owned();
+            rotated.push(".1");
+            let rotated = PathBuf::from(rotated);
+            let _ = fs::remove_file(&rotated);
+            if let Err(error) = fs::rename(&self.path, &rotated) {
+                eprintln!("Cannot rotate history log: {error}");
+            }
+        }
+        let line = match serde_json::to_string(record) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("Cannot serialize history entry: {error}");
+                return;
+            }
+        };
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.path)
+        {
+            Ok(mut file) => {
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600));
+                if let Err(error) = writeln!(file, "{line}") {
+                    eprintln!("Cannot write history: {error}");
+                    return;
+                }
+                let _ = file.sync_data();
+            }
+            Err(error) => eprintln!("Cannot open history file {}: {error}", self.path.display()),
+        }
+    }
+
+    fn read(&self) -> Vec<RunRecord> {
+        let mut records = Vec::new();
+        let mut rotated = self.path.as_os_str().to_owned();
+        rotated.push(".1");
+        read_history_file(&PathBuf::from(rotated), &mut records);
+        read_history_file(&self.path, &mut records);
+        records
+    }
+}
+
+fn read_history_file(path: &FsPath, records: &mut Vec<RunRecord>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        match serde_json::from_str::<RunRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(error) => eprintln!("Skipping invalid history entry: {error}"),
+        }
+    }
+}
+
+fn filter_history(
+    records: Vec<RunRecord>,
+    job: Option<&str>,
+    result: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> (Vec<RunRecord>, usize) {
+    let filtered: Vec<RunRecord> = records
+        .into_iter()
+        .rev()
+        .filter(|record| job.is_none_or(|job| record.job == job))
+        .filter(|record| result.is_none_or(|result| record.result == result))
+        .collect();
+    let total = filtered.len();
+    let items = filtered.into_iter().skip(offset).take(limit).collect();
+    (items, total)
 }
 
 fn client_ip(state: &AppState, request: &Request<Body>) -> IpAddr {
@@ -977,6 +1106,12 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     }
     config.audit_log_file = match config.audit_log_file.take() {
         None => Some(config.logs_dir.join("audit.jsonl")),
+        Some(path) if path.as_os_str().is_empty() => None,
+        Some(path) if path.is_relative() => Some(base.join(path)),
+        Some(path) => Some(path),
+    };
+    config.history_file = match config.history_file.take() {
+        None => Some(config.logs_dir.join("history.jsonl")),
         Some(path) if path.as_os_str().is_empty() => None,
         Some(path) if path.is_relative() => Some(base.join(path)),
         Some(path) => Some(path),
@@ -1857,6 +1992,17 @@ async fn run_job(state: Arc<AppState>, name: &str, origin: RunOrigin) -> ApiResu
             "exit_code": outcome.exit_code,
             "duration_ms": outcome.duration.as_millis().min(u64::MAX as u128) as u64,
         }));
+        state.record_history(RunRecord {
+            timestamp: Local::now().to_rfc3339(),
+            job: name.to_owned(),
+            origin: origin.as_str().to_owned(),
+            attempt,
+            max_attempts,
+            result: outcome.label().to_owned(),
+            exit_code: outcome.exit_code,
+            duration_ms: outcome.duration.as_millis().min(u64::MAX as u128) as u64,
+            timed_out: outcome.timed_out,
+        });
         let success = outcome.success();
         last_outcome = Some(outcome);
         if success || attempt == max_attempts {
@@ -2183,6 +2329,69 @@ struct LogQuery {
 }
 
 #[derive(Deserialize)]
+struct HistoryQuery {
+    job: Option<String>,
+    result: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+const DEFAULT_HISTORY_LIMIT: usize = 50;
+const MAX_HISTORY_LIMIT: usize = 200;
+
+async fn get_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+) -> ApiResult<Json<Value>> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let job = query.job.as_deref().filter(|value| !value.is_empty());
+    if let Some(job) = job
+        && !valid_job_name(job)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Job name must contain only letters, numbers, '-' or '_'.",
+        ));
+    }
+    let result = query
+        .result
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    if let Some(result) = &result
+        && !matches!(result.as_str(), "success" | "error" | "timeout")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "result must be success, error or timeout.",
+        ));
+    }
+
+    let Some(history) = &state.history else {
+        return Ok(Json(json!({
+            "enabled": false,
+            "items": [],
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
+        })));
+    };
+    let records = history.read();
+    let (items, total) = filter_history(records, job, result.as_deref(), limit, offset);
+    Ok(Json(json!({
+        "enabled": true,
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+#[derive(Deserialize)]
 struct LogTailQuery {
     offset: Option<u64>,
 }
@@ -2352,6 +2561,7 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "jobs_dir": state.config.jobs_dir.display().to_string(),
         "logs_dir": state.config.logs_dir.display().to_string(),
         "job_count": jobs.len(),
+        "history_enabled": state.history.is_some(),
         "active_count": jobs.iter().filter(|job| job.status == "ativo").count(),
         "running": running,
         "now": Local::now().to_rfc3339()
@@ -2503,6 +2713,23 @@ fn prepare_storage(config: &Config) -> std::io::Result<()> {
             let _ = fs::set_permissions(audit, fs::Permissions::from_mode(0o600));
         }
     }
+    if let Some(history) = &config.history_file {
+        if let Some(parent) = history.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+        for path in [history.clone(), {
+            let mut rotated = history.as_os_str().to_owned();
+            rotated.push(".1");
+            PathBuf::from(rotated)
+        }] {
+            if path.is_file() {
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2589,6 +2816,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .audit_log_file
         .clone()
         .map(|path| Arc::new(AuditLog::new(path)));
+    let history = config
+        .history_file
+        .clone()
+        .map(|path| Arc::new(HistoryLog::new(path)));
     let state = Arc::new(AppState {
         config: config.clone(),
         repository_lock: Arc::new(Mutex::new(())),
@@ -2598,6 +2829,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token_digest: digest,
         guard,
         audit,
+        history,
         last_tick: Arc::new(StdMutex::new(None)),
         metrics: Arc::new(Metrics::new()),
         http_client,
@@ -2606,6 +2838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let api: Router = Router::new()
         .route("/api/info", get(get_info))
+        .route("/api/history", get(get_history))
         .route("/api/jobs", get(get_jobs).post(create_job))
         .route(
             "/api/jobs/{name}",
@@ -2849,6 +3082,67 @@ mod tests {
         assert!(payload.get("action").is_none());
         assert!(payload.get("log").is_none());
         assert!(!payload.to_string().contains("secret-command"));
+    }
+
+    #[test]
+    fn filters_and_paginates_history_newest_first() {
+        let record = |job: &str, attempt: u32, result: &str| RunRecord {
+            timestamp: format!("2026-11-01T00:00:0{attempt}Z"),
+            job: job.to_owned(),
+            origin: "manual".to_owned(),
+            attempt,
+            max_attempts: 3,
+            result: result.to_owned(),
+            exit_code: Some(0),
+            duration_ms: 10,
+            timed_out: false,
+        };
+        let records = vec![
+            record("alpha", 1, "error"),
+            record("alpha", 2, "success"),
+            record("beta", 1, "timeout"),
+        ];
+        let (items, total) = filter_history(records.clone(), Some("alpha"), None, 1, 0);
+        assert_eq!(total, 2);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].attempt, 2);
+        assert_eq!(items[0].result, "success");
+
+        let (items, total) = filter_history(records, None, Some("timeout"), 10, 0);
+        assert_eq!(total, 1);
+        assert_eq!(items[0].job, "beta");
+    }
+
+    #[test]
+    fn appends_and_reads_history_jsonl() {
+        let directory = std::env::temp_dir().join(format!(
+            "datatask-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let history = HistoryLog::new(directory.join("history.jsonl"));
+        let record = RunRecord {
+            timestamp: "2026-11-01T00:00:00Z".to_owned(),
+            job: "alpha".to_owned(),
+            origin: "scheduler".to_owned(),
+            attempt: 1,
+            max_attempts: 1,
+            result: "success".to_owned(),
+            exit_code: Some(0),
+            duration_ms: 42,
+            timed_out: false,
+        };
+        history.append(&record);
+        history.append(&record);
+        let records = history.read();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].job, "alpha");
+        assert_eq!(records[0].duration_ms, 42);
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

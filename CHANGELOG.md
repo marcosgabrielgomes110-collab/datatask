@@ -21,6 +21,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   acesso remoto autenticado.
 - Retry por job com backoff exponencial (`retries`, `retry_delay_seconds`) e
   webhook `notify_url` em falha/timeout, sem enviar `action` ou log.
+- Histórico persistente de tentativas em `history_file` (JSONL), com filtros,
+  paginação e tela própria no painel.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

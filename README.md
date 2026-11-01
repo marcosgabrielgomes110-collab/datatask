@@ -32,6 +32,7 @@ auth_failure_window_seconds = 60
 auth_lockout_seconds = 300
 trust_proxy_headers = false
 audit_log_file = "logs/audit.jsonl"
+history_file = "logs/history.jsonl"
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -61,6 +62,11 @@ confiável, senão o cliente pode falsificar o IP e escapar do limite.
 `auth.failure`, `auth.lockout`, `request.rejected`) com data, IP, método, path,
 status, job e duração. Corpo de request, token e `action` **não** são gravados.
 O arquivo é `600` e rotaciona para `.1` em 5 MiB. Use `""` para desativar.
+
+`history_file` guarda cada tentativa de execução em JSONL (`timestamp`, job,
+origem, tentativa, resultado, exit code, duração e timeout). O arquivo é `600`,
+rotaciona para `.1` em 20 MiB e pode ser desativado com `""`; a API e o painel
+continuam funcionando com histórico vazio.
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -142,6 +148,8 @@ que podem ser desativadas nas preferências. A navegação lateral separa:
 - **Logs** — lista de tarefas, visualizador com acompanhamento ao vivo
   (polling incremental por offset), filtro de linhas, quebra de linha,
   rolagem automática, download e limpeza do log.
+- **Histórico** — tentativas persistidas com filtro por tarefa/resultado,
+  paginação, tentativa, duração, exit code e origem (agenda ou manual).
 - **Configurações** — conexão (conectar/desconectar), preferências (intervalo
   de atualização, intervalo do log ao vivo, animações, linhas compactas,
   quebra de linha) e informações do servidor.
@@ -329,13 +337,16 @@ Redirecionamentos HTTP não são seguidos e o timeout é
 
 ## API
 
-Todas as rotas abaixo, exceto `/health` e `/readyz`, precisam do cabeçalho de
-autenticação Bearer, com o valor configurado em `api_token`.
+Todas as rotas abaixo exigem autenticação Bearer, exceto `/health`, `/readyz`
+e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
 
 - `GET /health` — liveness do processo
 - `GET /readyz` — prontidão: scheduler ativo, lag do último tick e jobs em execução
 - `GET /metrics` — métricas Prometheus; loopback não exige token, acesso remoto exige Bearer
 - `GET /api/info` — versão, diretórios, intervalos, contagens e jobs em execução
+- `GET /api/history?job=&result=&limit=&offset=` — tentativas persistidas, mais
+  recentes primeiro; `result` aceita `success`, `error` ou `timeout`; `limit`
+  padrão 50 (máx. 200)
 - `GET /api/jobs` — listar jobs
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,
   `action` e, opcionalmente, `status`, `working_dir`, `timeout_seconds`,
@@ -370,6 +381,21 @@ curl -X POST http://127.0.0.1:8080/api/jobs \
 
 Os campos `action` executam comandos pelo shell do sistema. Crie ou altere jobs
 somente por meio de clientes confiáveis e mantenha o token secreto.
+
+## Histórico de execuções
+
+Cada tentativa (incluindo retries) é acrescentada em `history_file` como uma
+linha JSON. O histórico sobrevive a reinícios, é exibido na aba **Histórico** e
+pode ser consultado pela API:
+
+```bash
+curl -H "Authorization: Bearer $DATATASK_API_TOKEN" \
+  "http://127.0.0.1:8080/api/history?job=backup&result=error&limit=50&offset=0"
+```
+
+O endpoint retorna `items`, `total`, `limit`, `offset` e `enabled`, com os
+registros mais recentes primeiro. O arquivo rotaciona para `.1` em 20 MiB e
+`history_file = ""` desativa a persistência.
 
 ## Métricas
 

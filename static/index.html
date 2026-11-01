@@ -65,6 +65,10 @@
           <svg aria-hidden="true"><use href="#i-terminal"/></svg>
           <span>Logs</span>
         </a>
+        <a class="nav-link" href="#/historico" data-view="historico">
+          <svg aria-hidden="true"><use href="#i-clock"/></svg>
+          <span>Histórico</span>
+        </a>
         <a class="nav-link" href="#/config" data-view="config">
           <svg aria-hidden="true"><use href="#i-settings"/></svg>
           <span>Configurações</span>
@@ -233,6 +237,57 @@
               <span id="logUpdated">—</span>
             </div>
           </section>
+        </div>
+      </section>
+
+      <!-- ----------------------------- Histórico ----------------------------- -->
+      <section class="view" id="view-historico" aria-labelledby="viewTitle">
+        <div class="table-toolbar">
+          <div>
+            <h2 class="section-title">Execuções</h2>
+            <p class="section-sub" id="historySummary">Carregue o histórico persistente de tentativas.</p>
+          </div>
+          <div class="toolbar-group">
+            <select class="select compact-select" id="historyJobFilter" aria-label="Filtrar histórico por tarefa">
+              <option value="">Todas as tarefas</option>
+            </select>
+            <select class="select compact-select" id="historyResultFilter" aria-label="Filtrar histórico por resultado">
+              <option value="">Todos os resultados</option>
+              <option value="success">Sucesso</option>
+              <option value="error">Falha</option>
+              <option value="timeout">Timeout</option>
+            </select>
+            <button class="button outline icon-only" id="historyRefresh" type="button" title="Atualizar histórico" aria-label="Atualizar histórico">
+              <svg aria-hidden="true"><use href="#i-refresh"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Quando</th>
+                <th>Tarefa</th>
+                <th>Resultado</th>
+                <th>Tentativa</th>
+                <th>Duração</th>
+                <th>Exit</th>
+                <th>Origem</th>
+              </tr>
+            </thead>
+            <tbody id="historyBody">
+              <tr><td class="table-message" colspan="7">Conecte-se à API para carregar o histórico.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="history-footer">
+          <span id="historyPage">—</span>
+          <div class="toolbar-actions">
+            <button class="button outline small" id="historyPrev" type="button" disabled>Anterior</button>
+            <button class="button outline small" id="historyNext" type="button" disabled>Próxima</button>
+          </div>
         </div>
       </section>
 
