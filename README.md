@@ -23,6 +23,7 @@ jobs_dir = "jobs"
 logs_dir = "logs"
 poll_interval_seconds = 1
 command_timeout_seconds = 300
+notification_timeout_seconds = 10
 max_concurrent_jobs = 4
 log_max_bytes = 10485760
 rate_limit_per_minute = 600
@@ -43,6 +44,7 @@ um proxy TLS na frente; mesmo assim, restrinja a porta ao proxy no firewall. A
 API não fala TLS nativamente — veja a seção abaixo.
 
 `command_timeout_seconds` limita a duração de cada comando.
+`notification_timeout_seconds` limita cada POST de webhook.
 `max_concurrent_jobs` limita quantos comandos rodam ao mesmo tempo (os
 agendamentos excedentes são tentados de novo no próximo ciclo).
 `log_max_bytes` rotaciona `logs/<nome>.log` para `.log.1` ao atingir o limite
@@ -258,6 +260,9 @@ a config e os dados existentes.
   jobs estão em execução; `/health` continua sendo apenas liveness.
 - `/metrics` só é anônimo para loopback; acesso remoto exige Bearer e expõe
   apenas agregados (sem nomes de jobs, comandos ou saídas).
+- `notify_url` faz POST para um destino escolhido por quem tem o token. Isso
+  pode alcançar serviços internos (SSRF); redirecionamentos são desligados, mas
+  trate o token como credencial administrativa e restrinja destinos confiáveis.
 - Cada comando roda em seu próprio grupo de processos; ao estourar o timeout,
   o grupo inteiro é encerrado (não apenas o `/bin/sh`).
 - O desligamento (SIGTERM/Ctrl+C) para o agendador e aguarda até 10 s pelos
@@ -284,12 +289,43 @@ Também são aceitos horários únicos nos formatos `DD MM AAAA HH MM` e
 `AAAA-MM-DD HH:MM`. O status do job é `ativo` ou `desativo`. Jobs únicos
 ficam desativados depois da tentativa de execução; jobs cron permanecem ativos.
 
-Campos opcionais por job: `working_dir` define o diretório em que o comando
-é executado (precisa existir no servidor; vazio usa o diretório do servidor) e
-`timeout_seconds` limita a duração do comando somente para esse job
-(`0` usa o padrão `command_timeout_seconds` de `config.toml`). Para limpar
-`working_dir` em um `PATCH`, envie `""`; para restaurar o tempo limite padrão,
-envie `0`.
+Campos opcionais por job:
+
+- `working_dir` define o diretório em que o comando é executado (precisa existir
+  no servidor; vazio usa o diretório do servidor);
+- `timeout_seconds` limita a duração do comando somente para esse job
+  (`0` usa o padrão `command_timeout_seconds` de `config.toml`);
+- `retries` é o número de tentativas extras após uma falha ou timeout
+  (`0` a `10`, padrão `0`);
+- `retry_delay_seconds` é o atraso inicial do backoff exponencial
+  (`1` a `3600`, padrão `5`): 5 s, 10 s, 20 s… até o teto de 1 h;
+- `notify_url` é um webhook `http`/`https` chamado com `POST` **somente após
+  esgotar as tentativas** e o job continuar em falha/timeout.
+
+Para limpar `working_dir` em um `PATCH`, envie `""`; para limpar o webhook,
+envie `""`; para desativar retries, envie `retries: 0`. O backoff é mantido em
+memória: se o processo reiniciar durante a espera, as tentativas pendentes são
+perdidas (o próximo agendamento cron tenta novamente).
+
+O payload do webhook não inclui `action` nem saída de log:
+
+```json
+{
+  "event": "job.failed",
+  "job": "backup",
+  "description": "Backup diário",
+  "result": "error",
+  "exit_code": 7,
+  "timed_out": false,
+  "duration_ms": 1234,
+  "attempts": 3,
+  "max_attempts": 3,
+  "timestamp": "2026-11-01T07:00:00-03:00"
+}
+```
+
+Redirecionamentos HTTP não são seguidos e o timeout é
+`notification_timeout_seconds`.
 
 ## API
 
@@ -302,11 +338,13 @@ autenticação Bearer, com o valor configurado em `api_token`.
 - `GET /api/info` — versão, diretórios, intervalos, contagens e jobs em execução
 - `GET /api/jobs` — listar jobs
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,
-  `action` e, opcionalmente, `status`, `working_dir` e `timeout_seconds`
+  `action` e, opcionalmente, `status`, `working_dir`, `timeout_seconds`,
+  `retries`, `retry_delay_seconds` e `notify_url`
 - `GET /api/jobs/{name}` — consultar job (inclui `last_result`,
   `last_exit_code` e `last_duration_ms` após a primeira execução)
 - `PATCH /api/jobs/{name}` — alterar `description`, `datetime`, `action`,
-  `status`, `working_dir` ou `timeout_seconds`
+  `status`, `working_dir`, `timeout_seconds`, `retries`,
+  `retry_delay_seconds` ou `notify_url`
 - `POST /api/jobs/{name}/activate` — ativar
 - `POST /api/jobs/{name}/deactivate` — desativar
 - `POST /api/jobs/{name}/run` — dispara a execução e responde `202` na hora;

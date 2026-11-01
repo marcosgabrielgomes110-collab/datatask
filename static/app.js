@@ -93,6 +93,9 @@
     jobAction: $("#jobAction"),
     jobWorkingDir: $("#jobWorkingDir"),
     jobTimeout: $("#jobTimeout"),
+    jobRetries: $("#jobRetries"),
+    jobRetryDelay: $("#jobRetryDelay"),
+    jobNotifyUrl: $("#jobNotifyUrl"),
     saveJobButton: $("#saveJobButton"),
     closeJobDialog: $("#closeJobDialog"),
     cancelJobButton: $("#cancelJobButton"),
@@ -631,6 +634,7 @@
       ["Executando agora", running ? `${running} (${info.running.join(", ")})` : "nenhuma"],
       ["Verificação de agenda", `${info.poll_interval_seconds}s`],
       ["Timeout padrão", `${info.command_timeout_seconds}s`],
+      ["Timeout de webhook", `${info.notification_timeout_seconds}s`],
       ["Jobs simultâneos", String(info.max_concurrent_jobs ?? "—")],
       ["Rotação de log", info.log_max_bytes ? formatBytes(info.log_max_bytes) : "desativada"],
       ["Rate limit", info.rate_limit_per_minute ? `${info.rate_limit_per_minute}/min por IP` : "desativado"],
@@ -1008,6 +1012,9 @@
     el.jobStatus.value = "ativo";
     el.jobWorkingDir.value = "";
     el.jobTimeout.value = "";
+    el.jobRetries.value = "";
+    el.jobRetryDelay.value = "";
+    el.jobNotifyUrl.value = "";
     el.jobName.disabled = false;
   }
 
@@ -1037,6 +1044,9 @@
     el.jobAction.value = job.action;
     el.jobWorkingDir.value = job.working_dir || "";
     el.jobTimeout.value = job.timeout_seconds || "";
+    el.jobRetries.value = job.retries || "";
+    el.jobRetryDelay.value = job.retry_delay_seconds || "";
+    el.jobNotifyUrl.value = job.notify_url || "";
     el.saveJobButton.textContent = "Salvar alterações";
     el.jobDialog.showModal();
   }
@@ -1058,6 +1068,9 @@
     el.jobAction.value = job.action;
     el.jobWorkingDir.value = job.working_dir || "";
     el.jobTimeout.value = job.timeout_seconds || "";
+    el.jobRetries.value = job.retries || "";
+    el.jobRetryDelay.value = job.retry_delay_seconds || "";
+    el.jobNotifyUrl.value = job.notify_url || "";
     el.saveJobButton.textContent = "Criar tarefa";
     el.jobDialog.showModal();
     toast(`Cópia preparada como "${name}". Revise e salve.`, "info");
@@ -1077,13 +1090,40 @@
           throw new Error("O tempo limite deve ser entre 1 e 86.400 segundos.");
         }
       }
+      const retriesValue = el.jobRetries.value;
+      let retries = 0;
+      if (retriesValue !== "") {
+        retries = Number(retriesValue);
+        if (!Number.isInteger(retries) || retries < 0 || retries > 10) {
+          throw new Error("As tentativas extras devem ser entre 0 e 10.");
+        }
+      }
+      const retryDelayValue = el.jobRetryDelay.value;
+      let retryDelay = 0;
+      if (retryDelayValue !== "") {
+        retryDelay = Number(retryDelayValue);
+        if (!Number.isInteger(retryDelay) || retryDelay < 1 || retryDelay > 3600) {
+          throw new Error("O atraso entre tentativas deve ser entre 1 e 3.600 segundos.");
+        }
+      }
+      const notifyUrl = el.jobNotifyUrl.value.trim();
+      if (notifyUrl) {
+        let parsed;
+        try { parsed = new URL(notifyUrl); } catch (_) { parsed = null; }
+        if (!parsed || !["http:", "https:"].includes(parsed.protocol)) {
+          throw new Error("O webhook deve ser uma URL http ou https válida.");
+        }
+      }
       const payload = {
         description: el.jobDescription.value.trim(),
         datetime: buildSchedule(),
         action: el.jobAction.value.trim(),
         status: el.jobStatus.value,
         working_dir: workingDir,
-        timeout_seconds: timeoutSeconds
+        timeout_seconds: timeoutSeconds,
+        retries: retries,
+        retry_delay_seconds: retryDelay,
+        notify_url: notifyUrl
       };
       if (state.editing) {
         await api(`/api/jobs/${encodedName(state.editing)}`, { method: "PATCH", body: JSON.stringify(payload) });

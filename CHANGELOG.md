@@ -19,6 +19,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 - Endpoint `/metrics` no formato Prometheus com execuções por resultado,
   histograma de duração, jobs e saúde do scheduler; loopback sem token e
   acesso remoto autenticado.
+- Retry por job com backoff exponencial (`retries`, `retry_delay_seconds`) e
+  webhook `notify_url` em falha/timeout, sem enviar `action` ou log.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

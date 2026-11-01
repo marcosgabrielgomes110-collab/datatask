@@ -45,5 +45,8 @@ advisory com crédito, se desejado.
   nomes de jobs; proteja o arquivo como dado sensível.
 - `/metrics` é anônimo apenas para loopback. Scrapes remotos exigem Bearer e
   expõem somente agregados, sem nomes de jobs, comandos ou saídas.
+- `notify_url` permite que quem possui o token faça o servidor enviar POSTs
+  para destinos arbitrários (potencial SSRF). Redirecionamentos não são
+  seguidos; mantenha o token restrito e use apenas destinos confiáveis.
 - Se você encontrar token em log, histórico de shell, issue ou commit, rotacione
   imediatamente e remova o segredo do histórico.

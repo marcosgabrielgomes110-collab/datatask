@@ -63,6 +63,8 @@ struct Config {
     logs_dir: PathBuf,
     poll_interval_seconds: u64,
     command_timeout_seconds: u64,
+    #[serde(default = "default_notification_timeout_seconds")]
+    notification_timeout_seconds: u64,
     #[serde(default = "default_max_concurrent_jobs")]
     max_concurrent_jobs: usize,
     /// Rotate `NAME.log` to `NAME.log.1` once it reaches this size. `0` disables rotation.
@@ -110,6 +112,14 @@ fn default_auth_lockout_seconds() -> u64 {
     300
 }
 
+fn default_notification_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_retry_delay_seconds() -> u64 {
+    5
+}
+
 fn bind_is_loopback(value: &str) -> bool {
     value.eq_ignore_ascii_case("localhost")
         || value
@@ -131,6 +141,7 @@ struct AppState {
     audit: Option<Arc<AuditLog>>,
     last_tick: Arc<StdMutex<Option<Instant>>>,
     metrics: Arc<Metrics>,
+    http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -745,6 +756,12 @@ struct Job {
     working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_seconds: Option<u64>,
+    #[serde(default)]
+    retries: u32,
+    #[serde(default = "default_retry_delay_seconds")]
+    retry_delay_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notify_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -805,6 +822,9 @@ struct CreateJob {
     status: Option<String>,
     working_dir: Option<String>,
     timeout_seconds: Option<u64>,
+    retries: Option<u32>,
+    retry_delay_seconds: Option<u64>,
+    notify_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -816,6 +836,9 @@ struct UpdateJob {
     status: Option<String>,
     working_dir: Option<String>,
     timeout_seconds: Option<u64>,
+    retries: Option<u32>,
+    retry_delay_seconds: Option<u64>,
+    notify_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -966,6 +989,9 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     if config.command_timeout_seconds == 0 {
         return Err("command_timeout_seconds must be greater than zero.".to_owned());
     }
+    if config.notification_timeout_seconds == 0 {
+        return Err("notification_timeout_seconds must be greater than zero.".to_owned());
+    }
     if config.max_concurrent_jobs == 0 {
         return Err("max_concurrent_jobs must be greater than zero.".to_owned());
     }
@@ -1059,6 +1085,8 @@ fn clear_last_run_if_not_current_minute(job: &mut Job) {
 }
 
 const MAX_JOB_TIMEOUT_SECONDS: u64 = 86_400;
+const MAX_RETRIES: u32 = 10;
+const MAX_RETRY_DELAY_SECONDS: u64 = 3_600;
 
 /// Validates an explicit per-job timeout. `0` means "not set".
 fn normalize_timeout(seconds: u64) -> ApiResult<Option<u64>> {
@@ -1084,6 +1112,69 @@ fn normalize_working_dir(value: Option<&str>) -> ApiResult<Option<String>> {
         ));
     }
     Ok(Some(trimmed.to_owned()))
+}
+
+fn normalize_retries(value: u32) -> ApiResult<u32> {
+    if value > MAX_RETRIES {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("retries must be between 0 and {MAX_RETRIES}."),
+        ));
+    }
+    Ok(value)
+}
+
+fn normalize_retry_delay(value: u64) -> ApiResult<u64> {
+    let value = if value == 0 {
+        default_retry_delay_seconds()
+    } else {
+        value
+    };
+    if value > MAX_RETRY_DELAY_SECONDS {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("retry_delay_seconds must be between 1 and {MAX_RETRY_DELAY_SECONDS}."),
+        ));
+    }
+    Ok(value)
+}
+
+fn normalize_notify_url(value: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(trimmed) = value.map(str::trim).filter(|url| !url.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.len() > 2048 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "notify_url must be at most 2048 bytes.",
+        ));
+    }
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "notify_url must be a valid URL."))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "notify_url must use http or https.",
+        ));
+    }
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "notify_url must include a host and must not embed credentials.",
+        ));
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn retry_delay(attempt: u32, base_seconds: u64) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(10);
+    let multiplier = 1u64 << exponent;
+    Duration::from_secs(
+        base_seconds
+            .max(1)
+            .saturating_mul(multiplier)
+            .min(MAX_RETRY_DELAY_SECONDS),
+    )
 }
 
 fn validate_text_length(field: &str, value: &str, maximum: usize) -> ApiResult<()> {
@@ -1112,6 +1203,8 @@ fn read_job(config: &Config, name: &str) -> ApiResult<Job> {
         )
     })?;
     job.status = normalize_status(&job.status)?;
+    job.retries = job.retries.min(MAX_RETRIES);
+    job.retry_delay_seconds = job.retry_delay_seconds.clamp(1, MAX_RETRY_DELAY_SECONDS);
     job.log = format!("logs/{}.log", job.name);
     Ok(job)
 }
@@ -1581,6 +1674,9 @@ async fn create_job(
     let status = normalize_status(payload.status.as_deref().unwrap_or("ativo"))?;
     let working_dir = normalize_working_dir(payload.working_dir.as_deref())?;
     let timeout_seconds = normalize_timeout(payload.timeout_seconds.unwrap_or(0))?;
+    let retries = normalize_retries(payload.retries.unwrap_or(0))?;
+    let retry_delay_seconds = normalize_retry_delay(payload.retry_delay_seconds.unwrap_or(0))?;
+    let notify_url = normalize_notify_url(payload.notify_url.as_deref())?;
     let job = Job {
         name: payload.name.clone(),
         description: payload.description,
@@ -1591,6 +1687,9 @@ async fn create_job(
         last_run: None,
         working_dir,
         timeout_seconds,
+        retries,
+        retry_delay_seconds,
+        notify_url,
         last_result: None,
         last_exit_code: None,
         last_duration_ms: None,
@@ -1637,6 +1736,15 @@ async fn update_job(
     }
     if let Some(timeout_seconds) = payload.timeout_seconds {
         job.timeout_seconds = normalize_timeout(timeout_seconds)?;
+    }
+    if let Some(retries) = payload.retries {
+        job.retries = normalize_retries(retries)?;
+    }
+    if let Some(retry_delay_seconds) = payload.retry_delay_seconds {
+        job.retry_delay_seconds = normalize_retry_delay(retry_delay_seconds)?;
+    }
+    if let Some(notify_url) = payload.notify_url {
+        job.notify_url = normalize_notify_url(Some(&notify_url))?;
     }
     if let Some(status) = payload.status {
         let next_status = normalize_status(&status)?;
@@ -1704,18 +1812,6 @@ async fn delete_job(
 }
 
 async fn run_job(state: Arc<AppState>, name: &str, origin: RunOrigin) -> ApiResult<()> {
-    // Cap the total number of concurrent commands so a burst of schedules cannot
-    // exhaust the machine. Scheduled runs that hit the cap are skipped and
-    // retried on the next tick.
-    let _slot = state.job_slots.clone().try_acquire_owned().map_err(|_| {
-        api_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "Too many jobs running at once (limit {}).",
-                state.config.max_concurrent_jobs
-            ),
-        )
-    })?;
     let job = {
         let _guard = state.repository_lock.lock().await;
         let mut running = lock_running(&state);
@@ -1739,17 +1835,41 @@ async fn run_job(state: Arc<AppState>, name: &str, origin: RunOrigin) -> ApiResu
         name: name.to_owned(),
     };
 
-    let outcome = execute_command(&state, &job).await;
-    record_outcome(&state, name, &outcome).await;
-    state.audit(json!({
-        "ts": Local::now().to_rfc3339(),
-        "event": "job.run",
-        "job": name,
-        "origin": origin.as_str(),
-        "result": outcome.label(),
-        "exit_code": outcome.exit_code,
-        "duration_ms": outcome.duration.as_millis().min(u64::MAX as u128) as u64,
-    }));
+    let max_attempts = job.retries.saturating_add(1);
+    let mut last_outcome = None;
+    for attempt in 1..=max_attempts {
+        // Acquire per attempt so a long backoff does not hold a concurrency slot.
+        let _slot =
+            state.job_slots.clone().acquire_owned().await.map_err(|_| {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "Job slots unavailable.")
+            })?;
+        let outcome = execute_command(&state, &job).await;
+        drop(_slot);
+        record_outcome(&state, name, &outcome).await;
+        state.audit(json!({
+            "ts": Local::now().to_rfc3339(),
+            "event": "job.run",
+            "job": name,
+            "origin": origin.as_str(),
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "result": outcome.label(),
+            "exit_code": outcome.exit_code,
+            "duration_ms": outcome.duration.as_millis().min(u64::MAX as u128) as u64,
+        }));
+        let success = outcome.success();
+        last_outcome = Some(outcome);
+        if success || attempt == max_attempts {
+            break;
+        }
+        let delay = retry_delay(attempt, job.retry_delay_seconds);
+        append_retry_notice(&state.config, name, attempt + 1, max_attempts, delay);
+        time::sleep(delay).await;
+    }
+    let outcome = last_outcome.expect("run_job always performs at least one attempt");
+    if !outcome.success() {
+        notify_failure(&state, &job, &outcome, max_attempts).await;
+    }
 
     match outcome.label() {
         "success" => Ok(()),
@@ -1786,6 +1906,74 @@ async fn record_outcome(state: &AppState, name: &str, outcome: &RunOutcome) {
     job.last_duration_ms = Some(outcome.duration.as_millis().min(u64::MAX as u128) as u64);
     if let Err(error) = write_job(&state.config, &job) {
         eprintln!("Cannot record run outcome for '{name}': {}", error.1);
+    }
+}
+
+fn append_retry_notice(
+    config: &Config,
+    name: &str,
+    next_attempt: u32,
+    max_attempts: u32,
+    delay: Duration,
+) {
+    let path = config.logs_dir.join(format!("{name}.log"));
+    let Ok(mut file) = OpenOptions::new().append(true).open(&path) else {
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "───── DataTask · retry {next_attempt}/{max_attempts} em {:.0}s ─────\n",
+        delay.as_secs_f64()
+    );
+    let _ = file.flush();
+}
+
+fn notification_payload(job: &Job, outcome: &RunOutcome, attempts: u32) -> Value {
+    json!({
+        "event": "job.failed",
+        "job": job.name,
+        "description": job.description,
+        "result": outcome.label(),
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "duration_ms": outcome.duration.as_millis().min(u64::MAX as u128) as u64,
+        "attempts": attempts,
+        "max_attempts": job.retries.saturating_add(1),
+        "timestamp": Local::now().to_rfc3339(),
+    })
+}
+
+async fn notify_failure(state: &AppState, job: &Job, outcome: &RunOutcome, attempts: u32) {
+    let Some(url) = job.notify_url.as_deref() else {
+        return;
+    };
+    let payload = notification_payload(job, outcome, attempts);
+    match state.http_client.post(url).json(&payload).send().await {
+        Ok(response) => {
+            let status = response.status();
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "job.notify",
+                "job": job.name,
+                "status": status.as_u16(),
+            }));
+            if !status.is_success() {
+                eprintln!(
+                    "Webhook for '{}' returned HTTP {}.",
+                    job.name,
+                    status.as_u16()
+                );
+            }
+        }
+        Err(error) => {
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "job.notify",
+                "job": job.name,
+                "error": error.to_string(),
+            }));
+            eprintln!("Webhook for '{}' failed: {error}", job.name);
+        }
     }
 }
 
@@ -2155,6 +2343,7 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
             .collect::<Vec<_>>(),
         "poll_interval_seconds": state.config.poll_interval_seconds,
         "command_timeout_seconds": state.config.command_timeout_seconds,
+        "notification_timeout_seconds": state.config.notification_timeout_seconds,
         "max_concurrent_jobs": state.config.max_concurrent_jobs,
         "log_max_bytes": state.config.log_max_bytes,
         "rate_limit_per_minute": state.config.rate_limit_per_minute,
@@ -2385,6 +2574,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prepare_storage(&config)?;
 
     let config = Arc::new(config);
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.notification_timeout_seconds))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("DataTask/", env!("CARGO_PKG_VERSION")))
+        .build()?;
     let guard = Arc::new(AccessGuard::new(RateLimits {
         per_minute: config.rate_limit_per_minute,
         failure_limit: config.auth_failure_limit,
@@ -2406,6 +2600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit,
         last_tick: Arc::new(StdMutex::new(None)),
         metrics: Arc::new(Metrics::new()),
+        http_client,
     });
     let scheduler_handle = tokio::spawn(scheduler(state.clone()));
 
@@ -2587,6 +2782,73 @@ mod tests {
         assert!(!scheduler_readiness(Some(now - Duration::from_secs(9)), interval, now).0);
         assert_eq!(job_from_path("/api/jobs/task/logs"), Some("task"));
         assert_eq!(job_from_path("/api/jobs"), None);
+    }
+
+    #[test]
+    fn retries_use_exponential_backoff_with_cap() {
+        assert_eq!(retry_delay(1, 5), Duration::from_secs(5));
+        assert_eq!(retry_delay(2, 5), Duration::from_secs(10));
+        assert_eq!(retry_delay(3, 5), Duration::from_secs(20));
+        assert_eq!(retry_delay(10, 5), Duration::from_secs(2_560));
+        assert_eq!(
+            retry_delay(20, 5),
+            Duration::from_secs(MAX_RETRY_DELAY_SECONDS)
+        );
+        assert_eq!(retry_delay(1, 0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn validates_retry_settings_and_webhook_url() {
+        assert_eq!(normalize_retries(0).unwrap(), 0);
+        assert_eq!(normalize_retries(MAX_RETRIES).unwrap(), MAX_RETRIES);
+        assert!(normalize_retries(MAX_RETRIES + 1).is_err());
+        assert_eq!(normalize_retry_delay(0).unwrap(), 5);
+        assert_eq!(normalize_retry_delay(3).unwrap(), 3);
+        assert!(normalize_retry_delay(MAX_RETRY_DELAY_SECONDS + 1).is_err());
+        assert_eq!(normalize_notify_url(Some("")).unwrap(), None);
+        assert_eq!(
+            normalize_notify_url(Some("https://example.com/hook")).unwrap(),
+            Some("https://example.com/hook".to_owned())
+        );
+        assert!(normalize_notify_url(Some("ftp://example.com/hook")).is_err());
+        assert!(normalize_notify_url(Some("not a url")).is_err());
+        assert!(normalize_notify_url(Some("https://user:pass@example.com")).is_err());
+    }
+
+    #[test]
+    fn notification_payload_never_includes_action_or_log() {
+        let job = Job {
+            name: "backup".to_owned(),
+            description: "Rotina".to_owned(),
+            datetime: "* * * * *".to_owned(),
+            action: "secret-command".to_owned(),
+            log: "logs/backup.log".to_owned(),
+            status: "ativo".to_owned(),
+            last_run: None,
+            working_dir: None,
+            timeout_seconds: None,
+            retries: 2,
+            retry_delay_seconds: 5,
+            notify_url: Some("https://example.com/hook".to_owned()),
+            last_result: None,
+            last_exit_code: None,
+            last_duration_ms: None,
+        };
+        let outcome = RunOutcome {
+            exit_code: Some(2),
+            timed_out: false,
+            duration: Duration::from_millis(250),
+            error: None,
+        };
+        let payload = notification_payload(&job, &outcome, 3);
+        assert_eq!(payload["event"], "job.failed");
+        assert_eq!(payload["job"], "backup");
+        assert_eq!(payload["result"], "error");
+        assert_eq!(payload["attempts"], 3);
+        assert_eq!(payload["max_attempts"], 3);
+        assert!(payload.get("action").is_none());
+        assert!(payload.get("log").is_none());
+        assert!(!payload.to_string().contains("secret-command"));
     }
 
     #[test]

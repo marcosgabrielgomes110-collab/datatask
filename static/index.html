@@ -377,6 +377,21 @@
               <input class="input" id="jobTimeout" type="number" min="0" max="86400" step="1" placeholder="Padrão do servidor">
               <p class="hint">Em branco usa o valor do <code>config.toml</code>.</p>
             </div>
+            <div class="field">
+              <label for="jobRetries">Tentativas extras</label>
+              <input class="input" id="jobRetries" type="number" min="0" max="10" step="1" placeholder="0">
+              <p class="hint">0 desativa retry. O atraso cresce exponencialmente.</p>
+            </div>
+            <div class="field">
+              <label for="jobRetryDelay">Atraso inicial (segundos)</label>
+              <input class="input" id="jobRetryDelay" type="number" min="1" max="3600" step="1" placeholder="5">
+              <p class="hint">Usado entre tentativas; limite de 1 hora.</p>
+            </div>
+            <div class="field" style="grid-column:1/-1">
+              <label for="jobNotifyUrl">Webhook em falha/timeout</label>
+              <input class="input" id="jobNotifyUrl" type="url" spellcheck="false" placeholder="https://exemplo.com/hook">
+              <p class="hint">Recebe um POST JSON após esgotar as tentativas. Vazio desativa.</p>
+            </div>
           </div>
         </details>
       </div>

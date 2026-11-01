@@ -366,6 +366,7 @@ write_config() {
   local max_jobs="${9:-4}" log_max="${10:-10485760}"
   local rate_limit="${11:-600}" auth_limit="${12:-10}"
   local auth_window="${13:-60}" auth_lockout="${14:-300}"
+  local notify_timeout="${15:-10}"
   mkdir -p "$(dirname "$file")"
   local old_umask
   old_umask="$(umask)"
@@ -379,6 +380,7 @@ jobs_dir = "$jobs"
 logs_dir = "$logs"
 poll_interval_seconds = $poll
 command_timeout_seconds = $timeout
+notification_timeout_seconds = $notify_timeout
 max_concurrent_jobs = $max_jobs
 log_max_bytes = $log_max
 rate_limit_per_minute = $rate_limit
@@ -560,7 +562,7 @@ cmd_setup() {
 
   # Valores atuais (ou padrões) aparecem entre colchetes: Enter mantém.
   local cur_bind cur_port cur_jobs cur_logs cur_poll cur_timeout cur_token cur_token_file
-  local cur_max_jobs cur_log_max cur_rate cur_auth_limit cur_auth_window cur_auth_lockout
+  local cur_max_jobs cur_log_max cur_rate cur_auth_limit cur_auth_window cur_auth_lockout cur_notify
   local prev_tls prev_trust prev_audit prev_audit_set=0
   local prev_trusted prev_trusted_set=0
   cur_bind="$(config_get "$conf" bind_address)"
@@ -577,6 +579,7 @@ cmd_setup() {
   cur_auth_limit="$(config_get "$conf" auth_failure_limit)"
   cur_auth_window="$(config_get "$conf" auth_failure_window_seconds)"
   cur_auth_lockout="$(config_get "$conf" auth_lockout_seconds)"
+  cur_notify="$(config_get "$conf" notification_timeout_seconds)"
   prev_tls="$(config_get "$conf" tls_terminated_by_proxy)"
   prev_trust="$(config_get "$conf" trust_proxy_headers)"
   if grep -qE '^[[:space:]]*audit_log_file[[:space:]]*=' "$conf"; then
@@ -604,6 +607,7 @@ cmd_setup() {
   validate_uint "$cur_auth_limit" || cur_auth_limit=10
   validate_uint "$cur_auth_window" || cur_auth_window=60
   validate_uint "$cur_auth_lockout" || cur_auth_lockout=300
+  validate_uint "$cur_notify" && (( cur_notify >= 1 && cur_notify <= 3600 )) || cur_notify=10
   [[ -n "$cur_jobs" ]] || cur_jobs="jobs"
   [[ -n "$cur_logs" ]] || cur_logs="logs"
   [[ -n "$cur_bind" ]] || cur_bind="$DEFAULT_BIND"
@@ -640,7 +644,7 @@ cmd_setup() {
   fi
 
   write_config "$conf" "$bind" "$port" "$jobs" "$logs" "$poll" "$timeout" "$token" \
-    "$cur_max_jobs" "$cur_log_max" "$cur_rate" "$cur_auth_limit" "$cur_auth_window" "$cur_auth_lockout"
+    "$cur_max_jobs" "$cur_log_max" "$cur_rate" "$cur_auth_limit" "$cur_auth_window" "$cur_auth_lockout" "$cur_notify"
   chmod 600 "$conf" 2>/dev/null || true
 
   # Preserva opções avançadas que não têm prompt no setup.
