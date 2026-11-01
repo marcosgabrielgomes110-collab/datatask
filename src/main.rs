@@ -123,6 +123,10 @@ fn default_retry_delay_seconds() -> u64 {
     5
 }
 
+fn default_job_version() -> u64 {
+    1
+}
+
 fn bind_is_loopback(value: &str) -> bool {
     value.eq_ignore_ascii_case("localhost")
         || value
@@ -879,6 +883,9 @@ struct Job {
     action: String,
     log: String,
     status: String,
+    /// Incremented on user-configuration changes; used for optimistic locking.
+    #[serde(default = "default_job_version")]
+    version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -983,6 +990,68 @@ type ApiResult<T> = Result<T, ApiError>;
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     ApiError(status, message.into())
+}
+
+fn job_etag(version: u64) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"{version}\"")).unwrap_or(HeaderValue::from_static("\"1\""))
+}
+
+fn job_response(status: StatusCode, job: Job) -> Response {
+    let etag = job_etag(job.version);
+    let mut response = (status, Json(job)).into_response();
+    response.headers_mut().insert(header::ETAG, etag);
+    response
+}
+
+fn job_conflict_response(job: Job) -> Response {
+    let etag = job_etag(job.version);
+    let mut response = (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "Job was modified by another client. Reload it before saving.",
+            "current": job,
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(header::ETAG, etag);
+    response
+}
+
+fn if_match_allows(headers: &HeaderMap, version: u64) -> ApiResult<bool> {
+    let Some(value) = headers.get(header::IF_MATCH) else {
+        return Ok(true);
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid If-Match header."))?;
+    let text = text.trim();
+    if text == "*" {
+        return Ok(true);
+    }
+    let mut saw_numeric_tag = false;
+    for part in text.split(',') {
+        let mut tag = part.trim();
+        if let Some(rest) = tag.strip_prefix("W/") {
+            tag = rest.trim();
+        }
+        let tag = tag
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(tag);
+        if let Ok(candidate) = tag.parse::<u64>() {
+            saw_numeric_tag = true;
+            if candidate == version {
+                return Ok(true);
+            }
+        }
+    }
+    if !saw_numeric_tag {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "If-Match must contain a numeric job version.",
+        ));
+    }
+    Ok(false)
 }
 
 /// Reads the API token from `api_token` or from a separate private file.
@@ -1783,14 +1852,15 @@ async fn get_jobs(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Job>
 async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> ApiResult<Json<Job>> {
-    Ok(Json(read_job(&state.config, &name)?))
+) -> ApiResult<Response> {
+    let job = read_job(&state.config, &name)?;
+    Ok(job_response(StatusCode::OK, job))
 }
 
 async fn create_job(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateJob>,
-) -> ApiResult<(StatusCode, Json<Job>)> {
+) -> ApiResult<Response> {
     let _guard = state.repository_lock.lock().await;
     let path = job_path(&state.config, &payload.name)?;
     if path.exists() {
@@ -1819,6 +1889,7 @@ async fn create_job(
         action: payload.action,
         log: format!("logs/{}.log", payload.name),
         status,
+        version: 1,
         last_run: None,
         working_dir,
         timeout_seconds,
@@ -1830,14 +1901,15 @@ async fn create_job(
         last_duration_ms: None,
     };
     write_job(&state.config, &job)?;
-    Ok((StatusCode::CREATED, Json(job)))
+    Ok(job_response(StatusCode::CREATED, job))
 }
 
 async fn update_job(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<UpdateJob>,
-) -> ApiResult<Json<Job>> {
+) -> ApiResult<Response> {
     let _guard = state.repository_lock.lock().await;
     if lock_running(&state).contains(&name) {
         return Err(api_error(
@@ -1846,14 +1918,26 @@ async fn update_job(
         ));
     }
     let mut job = read_job(&state.config, &name)?;
+    if !if_match_allows(&headers, job.version)? {
+        return Ok(job_conflict_response(job));
+    }
+    let mut changed = false;
+
     if let Some(description) = payload.description {
         validate_text_length("description", &description, MAX_DESCRIPTION_BYTES)?;
-        job.description = description;
+        if job.description != description {
+            job.description = description;
+            changed = true;
+        }
     }
     if let Some(datetime) = payload.datetime {
         validate_schedule(&datetime)?;
         validate_text_length("datetime", &datetime, MAX_DATETIME_BYTES)?;
-        job.datetime = datetime.trim().to_owned();
+        let datetime = datetime.trim().to_owned();
+        if job.datetime != datetime {
+            job.datetime = datetime;
+            changed = true;
+        }
         clear_last_run_if_not_current_minute(&mut job);
     }
     if let Some(action) = payload.action {
@@ -1864,39 +1948,68 @@ async fn update_job(
                 "action cannot be empty.",
             ));
         }
-        job.action = action;
+        if job.action != action {
+            job.action = action;
+            changed = true;
+        }
     }
     if let Some(working_dir) = payload.working_dir {
-        job.working_dir = normalize_working_dir(Some(&working_dir))?;
+        let working_dir = normalize_working_dir(Some(&working_dir))?;
+        if job.working_dir != working_dir {
+            job.working_dir = working_dir;
+            changed = true;
+        }
     }
     if let Some(timeout_seconds) = payload.timeout_seconds {
-        job.timeout_seconds = normalize_timeout(timeout_seconds)?;
+        let timeout_seconds = normalize_timeout(timeout_seconds)?;
+        if job.timeout_seconds != timeout_seconds {
+            job.timeout_seconds = timeout_seconds;
+            changed = true;
+        }
     }
     if let Some(retries) = payload.retries {
-        job.retries = normalize_retries(retries)?;
+        let retries = normalize_retries(retries)?;
+        if job.retries != retries {
+            job.retries = retries;
+            changed = true;
+        }
     }
     if let Some(retry_delay_seconds) = payload.retry_delay_seconds {
-        job.retry_delay_seconds = normalize_retry_delay(retry_delay_seconds)?;
+        let retry_delay_seconds = normalize_retry_delay(retry_delay_seconds)?;
+        if job.retry_delay_seconds != retry_delay_seconds {
+            job.retry_delay_seconds = retry_delay_seconds;
+            changed = true;
+        }
     }
     if let Some(notify_url) = payload.notify_url {
-        job.notify_url = normalize_notify_url(Some(&notify_url))?;
+        let notify_url = normalize_notify_url(Some(&notify_url))?;
+        if job.notify_url != notify_url {
+            job.notify_url = notify_url;
+            changed = true;
+        }
     }
     if let Some(status) = payload.status {
         let next_status = normalize_status(&status)?;
-        if job.status != "ativo" && next_status == "ativo" {
-            clear_last_run_if_not_current_minute(&mut job);
+        if job.status != next_status {
+            if job.status != "ativo" && next_status == "ativo" {
+                clear_last_run_if_not_current_minute(&mut job);
+            }
+            job.status = next_status;
+            changed = true;
         }
-        job.status = next_status;
     }
-    write_job(&state.config, &job)?;
-    Ok(Json(job))
+    if changed {
+        job.version = job.version.saturating_add(1);
+        write_job(&state.config, &job)?;
+    }
+    Ok(job_response(StatusCode::OK, job))
 }
 
 async fn set_job_status(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     status: &'static str,
-) -> ApiResult<Json<Job>> {
+) -> ApiResult<Response> {
     let _guard = state.repository_lock.lock().await;
     if lock_running(&state).contains(&name) {
         return Err(api_error(
@@ -1905,25 +2018,28 @@ async fn set_job_status(
         ));
     }
     let mut job = read_job(&state.config, &name)?;
-    if job.status != "ativo" && status == "ativo" {
-        clear_last_run_if_not_current_minute(&mut job);
+    if job.status != status {
+        if job.status != "ativo" && status == "ativo" {
+            clear_last_run_if_not_current_minute(&mut job);
+        }
+        job.status = status.to_owned();
+        job.version = job.version.saturating_add(1);
+        write_job(&state.config, &job)?;
     }
-    job.status = status.to_owned();
-    write_job(&state.config, &job)?;
-    Ok(Json(job))
+    Ok(job_response(StatusCode::OK, job))
 }
 
 async fn activate_job(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> ApiResult<Json<Job>> {
+) -> ApiResult<Response> {
     set_job_status(State(state), Path(name), "ativo").await
 }
 
 async fn deactivate_job(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> ApiResult<Json<Job>> {
+) -> ApiResult<Response> {
     set_job_status(State(state), Path(name), "desativo").await
 }
 
@@ -1959,6 +2075,7 @@ async fn run_job(state: Arc<AppState>, name: &str, origin: RunOrigin) -> ApiResu
         }
         if parse_datetime(&job.datetime).is_ok() {
             job.status = "desativo".to_owned();
+            job.version = job.version.saturating_add(1);
         }
         job.last_run = Some(Local::now().format("%Y-%m-%d %H:%M").to_string());
         write_job(&state.config, &job)?;
@@ -3057,6 +3174,7 @@ mod tests {
             action: "secret-command".to_owned(),
             log: "logs/backup.log".to_owned(),
             status: "ativo".to_owned(),
+            version: 1,
             last_run: None,
             working_dir: None,
             timeout_seconds: None,
@@ -3143,6 +3261,22 @@ mod tests {
         assert_eq!(records[0].job, "alpha");
         assert_eq!(records[0].duration_ms, 42);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn parses_if_match_versions() {
+        let header = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_MATCH, HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        assert!(if_match_allows(&HeaderMap::new(), 1).unwrap());
+        assert!(if_match_allows(&header("\"1\""), 1).unwrap());
+        assert!(!if_match_allows(&header("\"2\""), 1).unwrap());
+        assert!(if_match_allows(&header("W/\"1\""), 1).unwrap());
+        assert!(if_match_allows(&header("\"1\", \"2\""), 2).unwrap());
+        assert!(if_match_allows(&header("*"), 99).unwrap());
+        assert!(if_match_allows(&header("not-a-version"), 1).is_err());
     }
 
     #[test]

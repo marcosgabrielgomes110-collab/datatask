@@ -123,6 +123,7 @@
     view: "tarefas",
     sort: { key: "name", dir: 1 },
     editing: null,
+    editingVersion: null,
     loadedOnce: false,
     logs: {
       job: null,
@@ -393,7 +394,9 @@
         setToken("");
         setConnection("offline", "Token inválido");
       }
-      throw new Error(message);
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
     }
     if (response.status === 204) return null;
     const contentType = response.headers.get("content-type") || "";
@@ -1129,6 +1132,7 @@
     el.jobRetryDelay.value = "";
     el.jobNotifyUrl.value = "";
     el.jobName.disabled = false;
+    state.editingVersion = null;
   }
 
   function openCreateDialog() {
@@ -1148,6 +1152,7 @@
   function openEditDialog(job) {
     state.editing = job.name;
     resetJobForm();
+    state.editingVersion = job.version || 1;
     el.formTitle.textContent = "Editar tarefa";
     el.jobName.value = job.name;
     el.jobName.disabled = true;
@@ -1239,7 +1244,9 @@
         notify_url: notifyUrl
       };
       if (state.editing) {
-        await api(`/api/jobs/${encodedName(state.editing)}`, { method: "PATCH", body: JSON.stringify(payload) });
+        const headers = {};
+        if (state.editingVersion) headers["If-Match"] = `"${state.editingVersion}"`;
+        await api(`/api/jobs/${encodedName(state.editing)}`, { method: "PATCH", body: JSON.stringify(payload), headers });
         toast("Tarefa atualizada.", "success");
       } else {
         payload.name = el.jobName.value.trim();
@@ -1249,7 +1256,13 @@
       el.jobDialog.close();
       await refreshData({ silent: true });
     } catch (error) {
-      toast(error.message, "error");
+      if (error.status === 409) {
+        toast("A tarefa foi alterada por outro cliente. Recarregue e edite novamente.", "error");
+        el.jobDialog.close();
+        await refreshData({ silent: true }).catch(() => {});
+      } else {
+        toast(error.message, "error");
+      }
     } finally {
       button.disabled = false;
     }

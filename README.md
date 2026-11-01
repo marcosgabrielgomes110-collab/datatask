@@ -351,11 +351,14 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,
   `action` e, opcionalmente, `status`, `working_dir`, `timeout_seconds`,
   `retries`, `retry_delay_seconds` e `notify_url`
-- `GET /api/jobs/{name}` — consultar job (inclui `last_result`,
-  `last_exit_code` e `last_duration_ms` após a primeira execução)
+- `GET /api/jobs/{name}` — consultar job (inclui `version`, `last_result`,
+  `last_exit_code` e `last_duration_ms` após a primeira execução); a resposta
+  traz `ETag: "<version>"`
 - `PATCH /api/jobs/{name}` — alterar `description`, `datetime`, `action`,
   `status`, `working_dir`, `timeout_seconds`, `retries`,
-  `retry_delay_seconds` ou `notify_url`
+  `retry_delay_seconds` ou `notify_url`. Envie `If-Match: "<version>"` para
+  concorrência otimista; versão divergente retorna `409` com o job atual. Sem
+  `If-Match`, o comportamento legado (last-write-wins) é mantido.
 - `POST /api/jobs/{name}/activate` — ativar
 - `POST /api/jobs/{name}/deactivate` — desativar
 - `POST /api/jobs/{name}/run` — dispara a execução e responde `202` na hora;
@@ -381,6 +384,24 @@ curl -X POST http://127.0.0.1:8080/api/jobs \
 
 Os campos `action` executam comandos pelo shell do sistema. Crie ou altere jobs
 somente por meio de clientes confiáveis e mantenha o token secreto.
+
+## Concorrência otimista
+
+Jobs têm `version`, incrementada em alterações de configuração (`PATCH`,
+ativar/desativar e desativação automática de job único). O `GET` do job devolve
+`ETag: "<version>"`. Para editar com segurança:
+
+```bash
+curl -X PATCH http://127.0.0.1:8080/api/jobs/exemplo \
+  -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -H 'If-Match: "3"' \
+  -d '{"description":"nova descrição"}'
+```
+
+Se outro cliente alterou o job antes, a resposta é `409` com o job atual no
+campo `current`; recarregue e refaça a edição. O painel usa esse fluxo
+automaticamente.
 
 ## Histórico de execuções
 
