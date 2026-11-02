@@ -16,8 +16,9 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
@@ -167,6 +168,56 @@ impl AppState {
 }
 
 const DURATION_BUCKETS: [f64; 7] = [0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0];
+
+/// Holds an exclusive `flock` for the data directory for the whole process
+/// lifetime, preventing two schedulers from running the same jobs.
+struct InstanceLock {
+    file: File,
+}
+
+impl InstanceLock {
+    fn acquire(path: &FsPath) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "Another DataTask instance is already using the jobs in {}. Stop it or use a different jobs_dir.",
+                        path.parent()
+                            .map(|parent| parent.display().to_string())
+                            .unwrap_or_else(|| path.display().to_string())
+                    ),
+                ));
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("Cannot lock {}: {error}", path.display()),
+            ));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 
 /// Process-local counters exposed at `/metrics`. Metrics are intentionally
 /// aggregate: job names and command output never appear in the exposition.
@@ -2916,6 +2967,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     drop(token);
     prepare_storage(&config)?;
+    let _instance_lock = InstanceLock::acquire(&config.jobs_dir.join(".datatask.lock"))?;
 
     let config = Arc::new(config);
     let http_client = reqwest::Client::builder()
@@ -3260,6 +3312,25 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].job, "alpha");
         assert_eq!(records[0].duration_ms, 42);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn prevents_two_instances_from_sharing_jobs() {
+        let directory = std::env::temp_dir().join(format!(
+            "datatask-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(".datatask.lock");
+        let first = InstanceLock::acquire(&path).unwrap();
+        assert!(InstanceLock::acquire(&path).is_err());
+        drop(first);
+        assert!(InstanceLock::acquire(&path).is_ok());
         let _ = fs::remove_dir_all(&directory);
     }
 

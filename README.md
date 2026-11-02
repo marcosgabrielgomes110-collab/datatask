@@ -273,6 +273,9 @@ a config e os dados existentes.
   trate o token como credencial administrativa e restrinja destinos confiáveis.
 - Cada comando roda em seu próprio grupo de processos; ao estourar o timeout,
   o grupo inteiro é encerrado (não apenas o `/bin/sh`).
+- O processo adquire um `flock` exclusivo em `jobs/.datatask.lock`; uma segunda
+  instância com o mesmo `jobs_dir` recusa iniciar, evitando execução duplicada.
+  O lock depende de `flock` do sistema de arquivos (evite NFS sem suporte).
 - O desligamento (SIGTERM/Ctrl+C) para o agendador e aguarda até 10 s pelos
   jobs em execução, para que os logs recebam o rodapé.
 - Ações de jobs executam comandos arbitrários com o usuário do serviço. Não

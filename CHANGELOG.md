@@ -25,6 +25,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   paginação e tela própria no painel.
 - Concorrência otimista com `version`/`ETag`/`If-Match` no `PATCH` de jobs,
   retornando `409` e o job atual em caso de conflito.
+- Lock de instância única via `flock` em `jobs/.datatask.lock`, impedindo dois
+  agendadores de executarem os mesmos jobs.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de
