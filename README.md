@@ -393,7 +393,9 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
 - `GET /api/history?job=&result=&limit=&offset=` — tentativas persistidas, mais
   recentes primeiro; `result` aceita `success`, `error` ou `timeout`; `limit`
   padrão 50 (máx. 200)
-- `GET /api/jobs` — listar jobs
+- `GET /api/jobs` — lista completa (array); com `?limit=&offset=` retorna
+  `{items,total,limit,offset}` (`limit` padrão 50, máximo 500). A listagem usa
+  cache em memória invalidado por mtime/tamanho dos arquivos
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,
   `action` e, opcionalmente, `status`, `working_dir`, `timeout_seconds`,
   `retries`, `retry_delay_seconds` e `notify_url`

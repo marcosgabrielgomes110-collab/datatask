@@ -29,6 +29,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   agendadores de executarem os mesmos jobs.
 - TLS nativo com `rustls` (`tls_cert_file`/`tls_key_file`), recarga por
   `SIGHUP`/`systemctl reload` e HSTS, mantendo o modo de proxy TLS.
+- Cache em memória da listagem de jobs com invalidação por mtime/tamanho e
+  paginação opcional em `/api/jobs` (`limit`/`offset`), mantendo o array padrão.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

@@ -26,7 +26,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -149,6 +149,7 @@ fn native_tls(config: &Config) -> bool {
 struct AppState {
     config: Arc<Config>,
     repository_lock: Arc<Mutex<()>>,
+    job_cache: Arc<JobCache>,
     running_jobs: Arc<StdMutex<HashSet<String>>>,
     /// PIDs that are also process-group leaders, so shutdown can terminate
     /// commands that outlive the grace period.
@@ -990,6 +991,31 @@ impl RunOrigin {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct JobStamp {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+struct JobCache {
+    state: StdMutex<JobCacheState>,
+}
+
+#[derive(Default)]
+struct JobCacheState {
+    stamp: Vec<JobStamp>,
+    jobs: Vec<Job>,
+}
+
+impl JobCache {
+    fn new() -> Self {
+        Self {
+            state: StdMutex::new(JobCacheState::default()),
+        }
+    }
+}
+
 impl RunOutcome {
     fn success(&self) -> bool {
         !self.timed_out && self.error.is_none() && self.exit_code == Some(0)
@@ -1579,7 +1605,7 @@ fn write_job(config: &Config, job: &Job) -> ApiResult<()> {
     Ok(())
 }
 
-fn list_jobs(config: &Config) -> ApiResult<Vec<Job>> {
+fn job_stamp(config: &Config) -> ApiResult<Vec<JobStamp>> {
     let entries = match fs::read_dir(&config.jobs_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1590,8 +1616,7 @@ fn list_jobs(config: &Config) -> ApiResult<Vec<Job>> {
             ));
         }
     };
-
-    let mut jobs = Vec::new();
+    let mut stamps = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             api_error(
@@ -1599,24 +1624,56 @@ fn list_jobs(config: &Config) -> ApiResult<Vec<Job>> {
                 format!("Cannot read jobs directory entry: {error}"),
             )
         })?;
-        if entry.path().extension().is_some_and(|ext| ext == "json") {
-            let name = entry
-                .path()
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .ok_or_else(|| {
-                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "Invalid job filename.")
-                })?
-                .to_owned();
-            // A single corrupt file (manual edit, partial restore) must not take
-            // down the whole listing or the panel.
-            match read_job(config, &name) {
-                Ok(job) => jobs.push(job),
-                Err(error) => eprintln!("Skipping invalid job '{name}': {}", error.1),
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Cannot inspect job '{}': {error}", path.display()),
+                ));
             }
+        };
+        stamps.push(JobStamp {
+            path,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        });
+    }
+    stamps.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(stamps)
+}
+
+/// Returns jobs from memory when the directory metadata is unchanged, otherwise
+/// re-reads the JSON files. A single corrupt file is skipped.
+fn list_jobs_cached(config: &Config, cache: &JobCache) -> ApiResult<Vec<Job>> {
+    let stamp = job_stamp(config)?;
+    let mut state = cache
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.stamp == stamp {
+        return Ok(state.jobs.clone());
+    }
+
+    let mut jobs = Vec::with_capacity(stamp.len());
+    for file in &stamp {
+        let Some(name) = file.path.file_stem().and_then(|stem| stem.to_str()) else {
+            eprintln!("Skipping job with an invalid filename.");
+            continue;
+        };
+        match read_job(config, name) {
+            Ok(job) => jobs.push(job),
+            Err(error) => eprintln!("Skipping invalid job '{name}': {}", error.1),
         }
     }
     jobs.sort_by(|left, right| left.name.cmp(&right.name));
+    state.stamp = stamp;
+    state.jobs = jobs.clone();
     Ok(jobs)
 }
 
@@ -1911,7 +1968,7 @@ async fn metrics(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
         state.guard.record_success(ip);
     }
 
-    let jobs = match list_jobs(&state.config) {
+    let jobs = match list_jobs_cached(&state.config, &state.job_cache) {
         Ok(jobs) => jobs,
         Err(error) => {
             eprintln!("Cannot collect job metrics: {}", error.1);
@@ -1952,8 +2009,28 @@ async fn dashboard() -> impl IntoResponse {
     )
 }
 
-async fn get_jobs(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Job>>> {
-    Ok(Json(list_jobs(&state.config)?))
+async fn get_jobs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<JobsQuery>,
+) -> ApiResult<Response> {
+    let jobs = list_jobs_cached(&state.config, &state.job_cache)?;
+    if query.limit.is_none() && query.offset.is_none() {
+        return Ok(Json(jobs).into_response());
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_JOBS_LIMIT)
+        .clamp(1, MAX_JOBS_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let total = jobs.len();
+    let items: Vec<Job> = jobs.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }))
+    .into_response())
 }
 
 async fn get_job(
@@ -2560,6 +2637,14 @@ struct HistoryQuery {
     offset: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct JobsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+const DEFAULT_JOBS_LIMIT: usize = 50;
+const MAX_JOBS_LIMIT: usize = 500;
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const MAX_HISTORY_LIMIT: usize = 200;
 
@@ -2758,7 +2843,7 @@ async fn clear_job_logs(
 }
 
 async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
-    let jobs = list_jobs(&state.config)?;
+    let jobs = list_jobs_cached(&state.config, &state.job_cache)?;
     let mut running: Vec<String> = lock_running(&state).iter().cloned().collect();
     running.sort();
     Ok(Json(json!({
@@ -3064,6 +3149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         config: config.clone(),
         repository_lock: Arc::new(Mutex::new(())),
+        job_cache: Arc::new(JobCache::new()),
         running_jobs: Arc::new(StdMutex::new(HashSet::new())),
         process_groups: Arc::new(StdMutex::new(HashSet::new())),
         job_slots: Arc::new(Semaphore::new(config.max_concurrent_jobs)),
@@ -3439,6 +3525,67 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].job, "alpha");
         assert_eq!(records[0].duration_ms, 42);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn job_cache_invalidates_when_files_change() {
+        let directory = std::env::temp_dir().join(format!(
+            "datatask-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let jobs_dir = directory.join("jobs");
+        let logs_dir = directory.join("logs");
+        fs::create_dir_all(&jobs_dir).unwrap();
+        fs::create_dir_all(&logs_dir).unwrap();
+        let config_path = directory.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "bind_address = \"127.0.0.1\"\nport = 8080\napi_token = \"{}\"\njobs_dir = \"{}\"\nlogs_dir = \"{}\"\npoll_interval_seconds = 1\ncommand_timeout_seconds = 5\n",
+                "0123456789abcdef".repeat(4),
+                jobs_dir.display(),
+                logs_dir.display()
+            ),
+        )
+        .unwrap();
+        let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
+        let (config, _) = load_config(&config_path).unwrap();
+        let cache = JobCache::new();
+        let job = Job {
+            name: "cached".to_owned(),
+            description: "original".to_owned(),
+            datetime: "* * * * *".to_owned(),
+            action: "exit 0".to_owned(),
+            log: "logs/cached.log".to_owned(),
+            status: "ativo".to_owned(),
+            version: 1,
+            last_run: None,
+            working_dir: None,
+            timeout_seconds: None,
+            retries: 0,
+            retry_delay_seconds: 5,
+            notify_url: None,
+            last_result: None,
+            last_exit_code: None,
+            last_duration_ms: None,
+        };
+        write_job(&config, &job).unwrap();
+        let first = list_jobs_cached(&config, &cache).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].description, "original");
+        assert_eq!(list_jobs_cached(&config, &cache).unwrap().len(), 1);
+
+        let mut changed = job;
+        changed.description = "changed-description".to_owned();
+        write_job(&config, &changed).unwrap();
+        let second = list_jobs_cached(&config, &cache).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].description, "changed-description");
         let _ = fs::remove_dir_all(&directory);
     }
 
