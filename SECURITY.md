@@ -25,9 +25,10 @@ advisory com crédito, se desejado.
 
 - **Token da API = execução de comandos.** Qualquer pessoa com o token pode
   criar jobs e rodar comandos como o usuário do serviço.
-- O servidor fala HTTP puro. Bind fora de loopback é recusado no boot, a menos
-  que `tls_terminated_by_proxy = true` e `trusted_proxy_ips` listem o(s) proxy(s).
-  Mesmo assim, restrinja a porta aos IPs do proxy no firewall.
+- O servidor usa HTTP por padrão. Bind fora de loopback é recusado no boot, a
+  menos que `tls_terminated_by_proxy = true` + `trusted_proxy_ips` indiquem um
+  proxy TLS, ou que `tls_cert_file`/`tls_key_file` habilitem TLS nativo
+  (`rustls`). Em ambos os casos, restrinja o acesso e proteja a chave (`600`).
 - Com `tls_terminated_by_proxy = true`, peers não-loopback fora da allowlist
   recebem `403`; os confiáveis precisam enviar `X-Forwarded-Proto: https`
   (exceto `/health` e `/readyz`). O header é falsificável, por isso a allowlist

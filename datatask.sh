@@ -10,7 +10,7 @@
 #   url         Mostra a URL do painel
 #   install     Instala e ativa o serviço no systemd (sudo)
 #   uninstall   Remove o serviço do systemd (sudo)
-#   start|stop|restart|status|logs   Controle do serviço (sudo)
+#   start|stop|restart|reload|status|logs   Controle do serviço (sudo)
 # =============================================================================
 set -Eeuo pipefail
 
@@ -85,7 +85,7 @@ ${C_BOLD}Comandos locais (sem sudo):${C_RESET}
 ${C_BOLD}Serviço systemd (precisa de sudo):${C_RESET}
   install            Instala backend + frontend (painel embutido) como serviço e ativa
   uninstall          Para e remove o serviço (mantém dados, salvo --purge)
-  start | stop | restart | status
+  start | stop | restart | reload | status
   logs               Acompanha os logs do serviço (journalctl)
 
 ${C_BOLD}Opções:${C_RESET}
@@ -417,20 +417,32 @@ ensure_token() {
 }
 
 panel_url() {
-  local file="$1" host port
+  local file="$1" host port scheme="http"
   host="$(config_get "$file" bind_address)"
   port="$(config_get "$file" port)"
+  if [[ -n "$(config_get "$file" tls_cert_file)" && -n "$(config_get "$file" tls_key_file)" ]]; then
+    scheme="https"
+  fi
   host="${host:-$DEFAULT_BIND}"
   port="${port:-$DEFAULT_PORT}"
   [[ "$host" == "0.0.0.0" || "$host" == "::" ]] && host="127.0.0.1"
-  printf 'http://%s:%s' "$host" "$port"
+  printf '%s://%s:%s' "$scheme" "$host" "$port"
 }
 
 http_get() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time 2 "$1"
+    if [[ "$1" == https://* ]]; then
+      # Health check local; certificados self-signed são aceitos aqui.
+      curl -kfsS --max-time 2 "$1"
+    else
+      curl -fsS --max-time 2 "$1"
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --timeout=2 "$1"
+    if [[ "$1" == https://* ]]; then
+      wget -qO- --no-check-certificate --timeout=2 "$1"
+    else
+      wget -qO- --timeout=2 "$1"
+    fi
   else
     return 1
   fi
@@ -567,6 +579,7 @@ cmd_setup() {
   local prev_tls prev_trust prev_audit prev_audit_set=0
   local prev_history prev_history_set=0
   local prev_trusted prev_trusted_set=0
+  local prev_cert prev_cert_set=0 prev_key prev_key_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -595,6 +608,14 @@ cmd_setup() {
   if grep -qE '^[[:space:]]*history_file[[:space:]]*=' "$conf"; then
     prev_history="$(config_get "$conf" history_file)"
     prev_history_set=1
+  fi
+  if grep -qE '^[[:space:]]*tls_cert_file[[:space:]]*=' "$conf"; then
+    prev_cert="$(config_get "$conf" tls_cert_file)"
+    prev_cert_set=1
+  fi
+  if grep -qE '^[[:space:]]*tls_key_file[[:space:]]*=' "$conf"; then
+    prev_key="$(config_get "$conf" tls_key_file)"
+    prev_key_set=1
   fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
@@ -638,14 +659,16 @@ cmd_setup() {
   [[ -n "$jobs" && -n "$logs" ]] || die "Os diretórios de tarefas e logs não podem ficar vazios."
 
   if [[ "$bind" != "127.0.0.1" && "$bind" != "::1" && "$bind" != "localhost" ]]; then
-    if [[ "$prev_tls" != "true" ]]; then
-      warn "Bind em '$bind' sem tls_terminated_by_proxy: o servidor vai recusar iniciar."
-      warn "Use 127.0.0.1 atrás de um proxy TLS ou defina tls_terminated_by_proxy = true (com firewall)."
-    elif [[ "$prev_trusted_set" -ne 1 || -z "$prev_trusted" || "$prev_trusted" == "[]" ]]; then
-      warn "Defina trusted_proxy_ips com o(s) IP(s) do proxy; sem isso o servidor vai recusar iniciar."
-    fi
-    if [[ "$prev_tls" == "true" && "$prev_trust" != "true" ]]; then
-      warn "Considere trust_proxy_headers = true para o rate limit distinguir clientes atrás do proxy."
+    if [[ "$prev_tls" == "true" ]]; then
+      if [[ "$prev_trusted_set" -ne 1 || -z "$prev_trusted" || "$prev_trusted" == "[]" ]]; then
+        warn "Defina trusted_proxy_ips com o(s) IP(s) do proxy; sem isso o servidor vai recusar iniciar."
+      fi
+      if [[ "$prev_trust" != "true" ]]; then
+        warn "Considere trust_proxy_headers = true para o rate limit distinguir clientes atrás do proxy."
+      fi
+    elif [[ -z "$prev_cert" || -z "$prev_key" ]]; then
+      warn "Bind em '$bind' sem TLS: o servidor vai recusar iniciar."
+      warn "Use 127.0.0.1 atrás de um proxy TLS, configure tls_cert_file/tls_key_file ou use tls_terminated_by_proxy = true."
     fi
   fi
 
@@ -659,6 +682,8 @@ cmd_setup() {
   [[ "$prev_trusted_set" -eq 1 ]] && config_set_raw "$conf" trusted_proxy_ips "$prev_trusted"
   [[ "$prev_audit_set" -eq 1 ]] && config_set_string "$conf" audit_log_file "$prev_audit"
   [[ "$prev_history_set" -eq 1 ]] && config_set_string "$conf" history_file "$prev_history"
+  [[ "$prev_cert_set" -eq 1 ]] && config_set_string "$conf" tls_cert_file "$prev_cert"
+  [[ "$prev_key_set" -eq 1 ]] && config_set_string "$conf" tls_key_file "$prev_key"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then
@@ -752,11 +777,12 @@ cmd_url() {
 }
 
 http_status_auth() {
-  local endpoint="$1" token="$2"
+  local endpoint="$1" token="$2" insecure=()
   if command -v curl >/dev/null 2>&1; then
+    [[ "$endpoint" == https://* ]] && insecure=(-k)
     # Pass the credential on stdin (`-H @-`) so it never appears in `ps`.
     printf 'Authorization: Bearer %s\n' "$token" \
-      | curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+      | curl -s "${insecure[@]}" -o /dev/null -w '%{http_code}' --max-time 3 \
           -H @- "${endpoint}/api/jobs" 2>/dev/null || true
   else
     echo "000"
@@ -905,6 +931,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${DATA_DIR}
 ExecStart=${BIN_PATH} ${CONF_FILE}
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10
@@ -1016,6 +1043,22 @@ prepare_service_files() {
     fi
   fi
 
+  # Caminhos relativos de TLS são resolvidos a partir da config de origem.
+  local cert_base cert_file key_file
+  if [[ -n "$source" && -f "$source" ]]; then
+    cert_base="$(cd "$(dirname "$source")" && pwd)"
+  else
+    cert_base="$CONF_DIR"
+  fi
+  cert_file="$(config_get "$CONF_FILE" tls_cert_file)"
+  key_file="$(config_get "$CONF_FILE" tls_key_file)"
+  if [[ -n "$cert_file" && "$cert_file" != /* ]]; then
+    config_set_string "$CONF_FILE" tls_cert_file "${cert_base}/${cert_file}"
+  fi
+  if [[ -n "$key_file" && "$key_file" != /* ]]; then
+    config_set_string "$CONF_FILE" tls_key_file "${cert_base}/${key_file}"
+  fi
+
   # Se a config veio de outro lugar com caminhos relativos, ancora em DATA_DIR.
   local jobs logs
   jobs="$(config_get "$CONF_FILE" jobs_dir)"
@@ -1031,12 +1074,30 @@ prepare_service_files() {
   jobs="${jobs:-$JOBS_DIR}"
   logs="${logs:-$LOGS_DIR}"
 
-  local bind_addr tls_proxy trusted_raw
+  local bind_addr tls_proxy trusted_raw native_cert native_key
   bind_addr="$(config_get "$CONF_FILE" bind_address)"
   tls_proxy="$(config_get "$CONF_FILE" tls_terminated_by_proxy)"
   trusted_raw="$(config_get_raw "$CONF_FILE" trusted_proxy_ips)"
+  native_cert="$(config_get "$CONF_FILE" tls_cert_file)"
+  native_key="$(config_get "$CONF_FILE" tls_key_file)"
+  if [[ -n "$native_cert" || -n "$native_key" ]]; then
+    if [[ -z "$native_cert" || -z "$native_key" ]]; then
+      die "Configure tls_cert_file e tls_key_file juntos em $CONF_FILE."
+    fi
+    [[ -f "$native_cert" ]] || die "TLS cert não encontrado: $native_cert"
+    [[ -f "$native_key" ]] || die "TLS key não encontrado: $native_key"
+    local key_mode; key_mode="$(stat -c '%a' "$native_key" 2>/dev/null || echo 600)"
+    if (( 8#$key_mode & 077 )); then
+      warn "A chave TLS $native_key está acessível por grupo/outros; use chmod 600."
+    fi
+  fi
+  if [[ -n "$native_cert" && -n "$native_key" && "$tls_proxy" == "true" ]]; then
+    die "Escolha TLS nativo (tls_cert_file/tls_key_file) ou tls_terminated_by_proxy, não ambos, em $CONF_FILE."
+  fi
   if [[ "$bind_addr" != "127.0.0.1" && "$bind_addr" != "::1" && "$bind_addr" != "localhost" && "$tls_proxy" != "true" ]]; then
-    die "bind_address='${bind_addr}' exige TLS. Use 127.0.0.1 atrás de um proxy TLS ou defina tls_terminated_by_proxy = true em $CONF_FILE (somente com firewall restringindo a porta ao proxy)."
+    if [[ -z "$native_cert" || -z "$native_key" ]]; then
+      die "bind_address='${bind_addr}' exige TLS. Use 127.0.0.1 atrás de um proxy TLS, configure tls_cert_file/tls_key_file ou defina tls_terminated_by_proxy = true em $CONF_FILE."
+    fi
   fi
   if [[ "$bind_addr" != "127.0.0.1" && "$bind_addr" != "::1" && "$bind_addr" != "localhost" && "$tls_proxy" == "true" ]]; then
     if [[ -z "$trusted_raw" || "$trusted_raw" == "[]" ]]; then
@@ -1275,7 +1336,7 @@ case "$CMD" in
   doctor) cmd_doctor ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
-  start|stop|restart) service_action "$CMD" ;;
+  start|stop|restart|reload) service_action "$CMD" ;;
   status) cmd_status ;;
   logs) cmd_logs ;;
   help) usage ;;

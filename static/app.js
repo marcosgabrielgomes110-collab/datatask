@@ -648,6 +648,7 @@
     const items = [
       ["Versão", `v${info.version}`],
       ["Endereço", `${info.bind_address}:${info.port}`],
+      ["TLS nativo", info.native_tls ? "sim" : "não"],
       ["TLS via proxy", info.tls_terminated_by_proxy ? "sim" : "não"],
       ["X-Forwarded-For", info.trust_proxy_headers ? "confiado" : "ignorado"],
       ["Proxies confiáveis", info.trusted_proxy_ips?.length ? info.trusted_proxy_ips.join(", ") : "somente loopback"],

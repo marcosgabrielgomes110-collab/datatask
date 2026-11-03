@@ -56,6 +56,12 @@ struct Config {
     /// Loopback is always trusted; remote proxies must be listed explicitly.
     #[serde(default)]
     trusted_proxy_ips: Vec<IpAddr>,
+    /// Native TLS certificate and key. Set both or neither; they are mutually
+    /// exclusive with `tls_terminated_by_proxy`.
+    #[serde(default)]
+    tls_cert_file: Option<PathBuf>,
+    #[serde(default)]
+    tls_key_file: Option<PathBuf>,
     #[serde(default)]
     api_token: Option<String>,
     #[serde(default)]
@@ -133,6 +139,10 @@ fn bind_is_loopback(value: &str) -> bool {
         || value
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+fn native_tls(config: &Config) -> bool {
+    config.tls_cert_file.is_some() && config.tls_key_file.is_some()
 }
 
 #[derive(Clone)]
@@ -1236,6 +1246,21 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         Some(path) if path.is_relative() => Some(base.join(path)),
         Some(path) => Some(path),
     };
+    for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
+        if let Some(path) = path
+            && path.is_relative()
+        {
+            *path = base.join(&*path);
+        }
+    }
+    config.tls_cert_file = config
+        .tls_cert_file
+        .take()
+        .filter(|path| !path.as_os_str().is_empty());
+    config.tls_key_file = config
+        .tls_key_file
+        .take()
+        .filter(|path| !path.as_os_str().is_empty());
     let token = resolve_api_token(&mut config, base)?;
 
     if config.poll_interval_seconds == 0 {
@@ -1256,13 +1281,41 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     if config.auth_failure_limit > 0 && config.auth_lockout_seconds == 0 {
         return Err("auth_lockout_seconds must be greater than zero.".to_owned());
     }
-    if !bind_is_loopback(&config.bind_address) && !config.tls_terminated_by_proxy {
+    let has_native_tls = native_tls(&config);
+    match (&config.tls_cert_file, &config.tls_key_file) {
+        (Some(_), Some(_)) => {
+            if config.tls_terminated_by_proxy {
+                return Err(
+                    "Choose native TLS (tls_cert_file/tls_key_file) or tls_terminated_by_proxy, not both."
+                        .to_owned(),
+                );
+            }
+            if let Some(key) = &config.tls_key_file
+                && let Ok(metadata) = fs::metadata(key)
+                && !has_private_permissions(&metadata)
+            {
+                return Err(format!(
+                    "TLS key {} must not be accessible by group or others (chmod 600).",
+                    key.display()
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "Set both tls_cert_file and tls_key_file for native TLS, or neither.".to_owned(),
+            );
+        }
+    }
+    if !has_native_tls && !bind_is_loopback(&config.bind_address) && !config.tls_terminated_by_proxy
+    {
         return Err(format!(
-            "bind_address '{}' would expose plaintext HTTP. Keep bind_address = \"127.0.0.1\" behind a TLS reverse proxy, or set tls_terminated_by_proxy = true only when the port is reachable exclusively by that proxy.",
+            "bind_address '{}' would expose plaintext HTTP. Keep bind_address = \"127.0.0.1\" behind a TLS reverse proxy, set tls_terminated_by_proxy = true only when the port is reachable exclusively by that proxy, or configure native TLS with tls_cert_file/tls_key_file.",
             config.bind_address
         ));
     }
-    if config.tls_terminated_by_proxy
+    if !has_native_tls
+        && config.tls_terminated_by_proxy
         && !bind_is_loopback(&config.bind_address)
         && config.trusted_proxy_ips.is_empty()
     {
@@ -1271,9 +1324,12 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
                 .to_owned(),
         );
     }
-    if !config.tls_terminated_by_proxy && !config.trusted_proxy_ips.is_empty() {
+    if !config.tls_terminated_by_proxy
+        && !config.trust_proxy_headers
+        && !config.trusted_proxy_ips.is_empty()
+    {
         eprintln!(
-            "warning: trusted_proxy_ips is ignored because tls_terminated_by_proxy is false."
+            "warning: trusted_proxy_ips is ignored because tls_terminated_by_proxy and trust_proxy_headers are false."
         );
     }
     if config.tls_terminated_by_proxy
@@ -1773,7 +1829,7 @@ async fn security_headers(
     insert_header(headers, "cross-origin-opener-policy", "same-origin");
     insert_header(headers, "cross-origin-resource-policy", "same-origin");
     insert_header(headers, "content-security-policy", CONTENT_SECURITY_POLICY);
-    if state.config.tls_terminated_by_proxy {
+    if state.config.tls_terminated_by_proxy || native_tls(&state.config) {
         insert_header(headers, "strict-transport-security", "max-age=31536000");
     }
     if is_api {
@@ -2711,6 +2767,7 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "bind_address": state.config.bind_address,
         "port": state.config.port,
         "tls_terminated_by_proxy": state.config.tls_terminated_by_proxy,
+        "native_tls": native_tls(&state.config),
         "trust_proxy_headers": state.config.trust_proxy_headers,
         "trusted_proxy_ips": state
             .config
@@ -2951,6 +3008,21 @@ async fn wait_for_running_jobs(state: &AppState) {
     }
 }
 
+async fn resolve_bind_address(address: &str) -> io::Result<SocketAddr> {
+    if let Ok(address) = address.parse() {
+        return Ok(address);
+    }
+    tokio::net::lookup_host(address)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Cannot resolve bind address {address}."),
+            )
+        })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Files created by the scheduler (jobs, logs, rotated logs) must never be
@@ -3044,14 +3116,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(state.clone(), https_guard));
 
     let address = format!("{}:{}", config.bind_address, config.port);
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    println!("DataTask API listening on http://{address}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    if native_tls(&config) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cert = config
+            .tls_cert_file
+            .clone()
+            .expect("native_tls guarantees a certificate path");
+        let key = config
+            .tls_key_file
+            .clone()
+            .expect("native_tls guarantees a key path");
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Cannot load TLS certificate/key: {error}"),
+                )
+            })?;
+        let reload_tls = tls.clone();
+        let reload_cert = cert.clone();
+        let reload_key = key.clone();
+        tokio::spawn(async move {
+            let mut signal =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        eprintln!("Cannot listen for SIGHUP TLS reloads: {error}");
+                        return;
+                    }
+                };
+            loop {
+                signal.recv().await;
+                match reload_tls
+                    .reload_from_pem_file(&reload_cert, &reload_key)
+                    .await
+                {
+                    Ok(()) => eprintln!("TLS certificate and key reloaded."),
+                    Err(error) => eprintln!("Cannot reload TLS certificate/key: {error}"),
+                }
+            }
+        });
+        let socket = resolve_bind_address(&address).await?;
+        let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
+        println!("DataTask API listening on https://{address}");
+        axum_server::bind_rustls(socket, tls)
+            .handle(handle)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&address).await?;
+        println!("DataTask API listening on http://{address}");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    }
 
     // Stop scheduling new work, then give in-flight commands a short grace
     // period so their logs get a proper footer.

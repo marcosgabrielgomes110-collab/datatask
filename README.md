@@ -15,6 +15,9 @@ port = 8080
 tls_terminated_by_proxy = false
 # IPs de proxies remotos autorizados a enviar X-Forwarded-*; loopback é sempre confiável.
 trusted_proxy_ips = []
+# TLS nativo opcional (não combine com tls_terminated_by_proxy).
+# tls_cert_file = "/etc/datatask/cert.pem"
+# tls_key_file = "/etc/datatask/key.pem"
 # Recomendado: token em arquivo separado, com permissão 600.
 api_token_file = "/etc/datatask/api_token"
 # Alternativa (legado): token direto na config.
@@ -73,10 +76,11 @@ O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 deve ser `600`; o `install` do script já faz isso e move o token do serviço para
 `/etc/datatask/api_token`.
 
-## Exposição na rede e TLS
+## TLS e exposição na rede
 
-O DataTask **não termina TLS**. O modo recomendado é manter
-`bind_address = "127.0.0.1"` e colocar um proxy no mesmo host:
+O DataTask pode terminar TLS **nativamente** com `rustls` ou ficar atrás de um
+proxy reverso. Para o modo proxy, o recomendado é manter
+`bind_address = "127.0.0.1"` e colocar o proxy no mesmo host:
 
 ```caddyfile
 tasks.example.com {
@@ -122,6 +126,41 @@ Nesse caso:
 - o servidor envia `Strict-Transport-Security` quando o modo proxy TLS está ativo;
 - loopback é sempre confiável, então um proxy no mesmo host não precisa de
   allowlist (e o bind deve continuar em `127.0.0.1`).
+
+### TLS nativo
+
+Para terminar TLS no próprio processo, configure os dois arquivos e **não**
+use `tls_terminated_by_proxy`:
+
+```toml
+bind_address = "0.0.0.0"
+tls_cert_file = "/etc/datatask/cert.pem"
+tls_key_file = "/etc/datatask/key.pem"
+```
+
+A chave precisa ser `600`; o servidor recusa iniciar se grupo/outros puderem
+lê-la. O bind fora de loopback é permitido quando o TLS nativo está ativo.
+
+```bash
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout /etc/datatask/key.pem -out /etc/datatask/cert.pem \
+  -subj "/CN=tasks.local"
+sudo chmod 600 /etc/datatask/key.pem
+```
+
+Com `certbot`, aponte `tls_cert_file`/`tls_key_file` para
+`/etc/letsencrypt/live/<domínio>/fullchain.pem` e `privkey.pem` (o usuário do
+serviço precisa de acesso de leitura).
+
+Recarregar sem reiniciar:
+
+```bash
+sudo ./datatask.sh reload     # systemctl reload datatask (SIGHUP)
+# ou: sudo kill -HUP $(systemctl show -p MainPID --value datatask)
+```
+
+O certificado antigo continua ativo se a recarga falhar; o erro vai para o
+journal. HSTS é enviado nos dois modos (nativo e proxy).
 
 ## Executar
 
@@ -187,6 +226,7 @@ sudo ./datatask.sh install          # instala e ativa o serviço systemd
 sudo ./datatask.sh status           # estado + health check + checagem do frontend
 sudo ./datatask.sh logs             # journalctl -u datatask -f
 sudo ./datatask.sh restart
+sudo ./datatask.sh reload           # recarrega o certificado TLS (SIGHUP)
 sudo ./datatask.sh uninstall        # remove o serviço, mantém config e dados
 sudo ./datatask.sh uninstall --purge
 ```
@@ -239,9 +279,9 @@ No `install`, o serviço é criado com:
 - tarefas e logs em `/var/lib/datatask/{jobs,logs}` (`700`, arquivos `600`);
 - usuário do serviço = usuário que chamou o `sudo` (ou `--user`); se não for
   possível, cria o usuário de sistema `datatask`;
-- `Restart=on-failure` e endurecimento do systemd (`NoNewPrivileges`,
-  `ProtectSystem`, `CapabilityBoundingSet=`, `UMask=0077`, `LimitCORE=0`,
-  entre outros).
+- `Restart=on-failure`, `ExecReload` via `SIGHUP` e endurecimento do systemd
+  (`NoNewPrivileges`, `ProtectSystem`, `CapabilityBoundingSet=`, `UMask=0077`,
+  `LimitCORE=0`, entre outros).
 
 Após ativar, o script valida `/health`, `/readyz`, `/`, `/app.css` e `/app.js`,
 garantindo que backend **e** frontend estão no ar. Reexecutar `install` preserva
@@ -262,8 +302,11 @@ a config e os dados existentes.
 - Rate limit por IP e bloqueio temporário após falhas de autenticação; eventos
   relevantes vão para o audit JSONL, sem token, corpo ou `action`.
 - Fora de loopback, o boot exige `tls_terminated_by_proxy = true` e
-  `trusted_proxy_ips`; requests de proxies não listados recebem `403`, e sem
-  `X-Forwarded-Proto: https` recebem `426` e HSTS no modo proxy.
+  `trusted_proxy_ips`, ou TLS nativo com `tls_cert_file`/`tls_key_file`; requests
+  de proxies não listados recebem `403`, e sem `X-Forwarded-Proto: https`
+  recebem `426` e HSTS no modo proxy.
+- No TLS nativo a chave precisa ser `600`, o certificado é recarregado por
+  SIGHUP/`systemctl reload` e HSTS é enviado.
 - `/readyz` informa se o scheduler está ativo (lag do último tick) e quantos
   jobs estão em execução; `/health` continua sendo apenas liveness.
 - `/metrics` só é anônimo para loopback; acesso remoto exige Bearer e expõe

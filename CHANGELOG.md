@@ -27,6 +27,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   retornando `409` e o job atual em caso de conflito.
 - Lock de instância única via `flock` em `jobs/.datatask.lock`, impedindo dois
   agendadores de executarem os mesmos jobs.
+- TLS nativo com `rustls` (`tls_cert_file`/`tls_key_file`), recarga por
+  `SIGHUP`/`systemctl reload` e HSTS, mantendo o modo de proxy TLS.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de
