@@ -181,9 +181,9 @@ O painel tem tema escuro, layout responsivo (cartões no celular) e animações
 que podem ser desativadas nas preferências. A navegação lateral separa:
 
 - **Tarefas** — resumo (total, ativas, recorrentes, executadas hoje), busca,
-  filtro por status, ordenação por coluna, execução manual com indicador de
-  “executando”, histórico do último resultado (sucesso, falha ou timeout),
-  duplicação e edição.
+  filtro por status, ordenação por coluna, paginação server-side, execução
+  manual com indicador de “executando”, histórico do último resultado (sucesso,
+  falha ou timeout), duplicação e edição.
 - **Logs** — lista de tarefas, visualizador com acompanhamento ao vivo
   (polling incremental por offset), filtro de linhas, quebra de linha,
   rolagem automática, download e limpeza do log.
@@ -393,9 +393,10 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
 - `GET /api/history?job=&result=&limit=&offset=` — tentativas persistidas, mais
   recentes primeiro; `result` aceita `success`, `error` ou `timeout`; `limit`
   padrão 50 (máx. 200)
-- `GET /api/jobs` — lista completa (array); com `?limit=&offset=` retorna
-  `{items,total,limit,offset}` (`limit` padrão 50, máximo 500). A listagem usa
-  cache em memória invalidado por mtime/tamanho dos arquivos
+- `GET /api/jobs` — lista completa (array); com `?limit=&offset=&q=&status=&sort=&order=`
+  retorna `{items,total,limit,offset}` (`limit` padrão 50, máximo 500).
+  `sort` aceita `name`, `schedule`, `status` ou `last`; `order` é `asc`/`desc`.
+  A listagem usa cache em memória invalidado por mtime/tamanho dos arquivos
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,
   `action` e, opcionalmente, `status`, `working_dir`, `timeout_seconds`,
   `retries`, `retry_delay_seconds` e `notify_url`

@@ -2014,7 +2014,14 @@ async fn get_jobs(
     Query(query): Query<JobsQuery>,
 ) -> ApiResult<Response> {
     let jobs = list_jobs_cached(&state.config, &state.job_cache)?;
-    if query.limit.is_none() && query.offset.is_none() {
+    let paginated = query.limit.is_some()
+        || query.offset.is_some()
+        || query.q.is_some()
+        || query.status.is_some()
+        || query.sort.is_some()
+        || query.order.is_some();
+    let jobs = prepare_jobs(jobs, &query)?;
+    if !paginated {
         return Ok(Json(jobs).into_response());
     }
     let limit = query
@@ -2641,10 +2648,75 @@ struct HistoryQuery {
 struct JobsQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    q: Option<String>,
+    status: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
 }
 
 const DEFAULT_JOBS_LIMIT: usize = 50;
 const MAX_JOBS_LIMIT: usize = 500;
+
+fn prepare_jobs(mut jobs: Vec<Job>, query: &JobsQuery) -> ApiResult<Vec<Job>> {
+    if let Some(status) = query.status.as_deref() {
+        let status = normalize_status(status)?;
+        jobs.retain(|job| job.status == status);
+    }
+    if let Some(term) = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+    {
+        let term = term.to_lowercase();
+        jobs.retain(|job| {
+            job.name.to_lowercase().contains(&term)
+                || job.description.to_lowercase().contains(&term)
+        });
+    }
+    let sort = query.sort.as_deref().unwrap_or("name");
+    if let Some(order) = query.order.as_deref()
+        && !order.eq_ignore_ascii_case("asc")
+        && !order.eq_ignore_ascii_case("desc")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "order must be 'asc' or 'desc'.",
+        ));
+    }
+    match sort {
+        "name" => jobs.sort_by(|left, right| left.name.cmp(&right.name)),
+        "schedule" => jobs.sort_by(|left, right| {
+            left.datetime
+                .cmp(&right.datetime)
+                .then_with(|| left.name.cmp(&right.name))
+        }),
+        "status" => jobs.sort_by(|left, right| {
+            left.status
+                .cmp(&right.status)
+                .then_with(|| left.name.cmp(&right.name))
+        }),
+        "last" => jobs.sort_by(|left, right| {
+            left.last_run
+                .cmp(&right.last_run)
+                .then_with(|| left.name.cmp(&right.name))
+        }),
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "sort must be name, schedule, status or last.",
+            ));
+        }
+    }
+    if query
+        .order
+        .as_deref()
+        .is_some_and(|order| order.eq_ignore_ascii_case("desc"))
+    {
+        jobs.reverse();
+    }
+    Ok(jobs)
+}
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const MAX_HISTORY_LIMIT: usize = 200;
 
@@ -2846,6 +2918,20 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
     let jobs = list_jobs_cached(&state.config, &state.job_cache)?;
     let mut running: Vec<String> = lock_running(&state).iter().cloned().collect();
     running.sort();
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let active_count = jobs.iter().filter(|job| job.status == "ativo").count();
+    let recurring_count = jobs
+        .iter()
+        .filter(|job| job.datetime.split_whitespace().count() == 5)
+        .count();
+    let executed_today_count = jobs
+        .iter()
+        .filter(|job| {
+            job.last_run
+                .as_deref()
+                .is_some_and(|last_run| last_run.starts_with(&today))
+        })
+        .count();
     Ok(Json(json!({
         "name": "DataTask",
         "version": env!("CARGO_PKG_VERSION"),
@@ -2872,7 +2958,9 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "logs_dir": state.config.logs_dir.display().to_string(),
         "job_count": jobs.len(),
         "history_enabled": state.history.is_some(),
-        "active_count": jobs.iter().filter(|job| job.status == "ativo").count(),
+        "active_count": active_count,
+        "recurring_count": recurring_count,
+        "executed_today_count": executed_today_count,
         "running": running,
         "now": Local::now().to_rfc3339()
     })))
@@ -3526,6 +3614,43 @@ mod tests {
         assert_eq!(records[0].job, "alpha");
         assert_eq!(records[0].duration_ms, 42);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn filters_and_sorts_jobs_server_side() {
+        let job = |name: &str, description: &str, status: &str, last_run: Option<&str>| -> Job {
+            serde_json::from_value(json!({
+                "name": name,
+                "description": description,
+                "datetime": "* * * * *",
+                "action": "exit 0",
+                "log": format!("logs/{name}.log"),
+                "status": status,
+                "last_run": last_run,
+            }))
+            .unwrap()
+        };
+        let jobs = vec![
+            job("alpha", "backup diário", "ativo", Some("2026-11-01 10:00")),
+            job("beta", "limpeza", "desativo", None),
+            job("gamma", "backup semanal", "ativo", Some("2026-11-02 10:00")),
+        ];
+        let query = JobsQuery {
+            limit: None,
+            offset: None,
+            q: Some("backup".to_owned()),
+            status: Some("ativo".to_owned()),
+            sort: Some("last".to_owned()),
+            order: Some("desc".to_owned()),
+        };
+        let selected = prepare_jobs(jobs, &query).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|job| job.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gamma", "alpha"]
+        );
     }
 
     #[test]

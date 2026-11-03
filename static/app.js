@@ -51,6 +51,9 @@
     statusFilter: $("#statusFilter"),
     tasksSummary: $("#tasksSummary"),
     jobsBody: $("#jobsBody"),
+    jobsPage: $("#jobsPage"),
+    jobsPrev: $("#jobsPrev"),
+    jobsNext: $("#jobsNext"),
     statTotal: $("#statTotal"),
     statActive: $("#statActive"),
     statRecurring: $("#statRecurring"),
@@ -118,10 +121,12 @@
 
   const state = {
     jobs: [],
+    pickerJobs: [],
     running: new Set(),
     info: null,
     view: "tarefas",
     sort: { key: "name", dir: 1 },
+    jobsPage: { limit: 25, offset: 0, total: 0, q: "", status: "todas" },
     editing: null,
     editingVersion: null,
     loadedOnce: false,
@@ -144,7 +149,7 @@
       result: "",
       enabled: true
     },
-    timers: { auto: null, log: null, watch: null }
+    timers: { auto: null, log: null, watch: null, search: null }
   };
 
   let prefs = loadPrefs();
@@ -473,15 +478,38 @@
       return;
     }
     if (!state.loadedOnce && !silent) showTableSkeleton();
-    const [jobs, info] = await Promise.all([api("/api/jobs"), api("/api/info")]);
-    state.jobs = Array.isArray(jobs) ? jobs : [];
+    const params = new URLSearchParams({
+      limit: String(state.jobsPage.limit),
+      offset: String(state.jobsPage.offset),
+      sort: state.sort.key,
+      order: state.sort.dir === 1 ? "asc" : "desc"
+    });
+    if (state.jobsPage.q) params.set("q", state.jobsPage.q);
+    if (state.jobsPage.status && state.jobsPage.status !== "todas") {
+      params.set("status", state.jobsPage.status);
+    }
+    const [page, info] = await Promise.all([
+      api(`/api/jobs?${params.toString()}`),
+      api("/api/info")
+    ]);
+    state.jobs = Array.isArray(page?.items) ? page.items : [];
+    state.jobsPage.total = Number(page?.total) || 0;
+    state.jobsPage.limit = Number(page?.limit) || state.jobsPage.limit;
+    state.jobsPage.offset = Number(page?.offset) || 0;
+    if (state.view === "logs" || state.view === "historico") {
+      try {
+        const allJobs = await api("/api/jobs");
+        state.pickerJobs = Array.isArray(allJobs) ? allJobs : [];
+      } catch (_) { /* mantém o picker anterior */ }
+    }
     state.info = info;
     state.running = new Set(info?.running || []);
     state.loadedOnce = true;
     setConnection("online", "Sessão autenticada");
     el.sidebarVersion.textContent = `DataTask · v${info?.version || "—"}`;
     renderAll();
-    if (state.logs.job && !state.jobs.some(job => job.name === state.logs.job)) {
+    const picker = state.pickerJobs.length ? state.pickerJobs : state.jobs;
+    if (state.logs.job && !picker.some(job => job.name === state.logs.job)) {
       clearLogSelection();
     } else if (state.logs.job) {
       updateLogMeta();
@@ -499,13 +527,13 @@
   }
 
   function renderStats() {
-    const today = new Date();
-    const todayPrefix = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}-${pad2(today.getDate())}`;
-    el.statTotal.textContent = String(state.jobs.length);
-    el.statActive.textContent = String(state.jobs.filter(job => job.status === "ativo").length);
-    el.statRecurring.textContent = String(state.jobs.filter(job => isCron(job.datetime)).length);
-    el.statToday.textContent = String(state.jobs.filter(job => (job.last_run || "").startsWith(todayPrefix)).length);
-    const active = state.jobs.filter(job => job.status === "ativo").length;
+    const info = state.info;
+    const total = info ? Number(info.job_count) || 0 : null;
+    const active = info ? Number(info.active_count) || 0 : 0;
+    el.statTotal.textContent = total === null ? "—" : String(total);
+    el.statActive.textContent = total === null ? "—" : String(active);
+    el.statRecurring.textContent = total === null ? "—" : String(Number(info.recurring_count) || 0);
+    el.statToday.textContent = total === null ? "—" : String(Number(info.executed_today_count) || 0);
     el.navActiveCount.hidden = active === 0;
     el.navActiveCount.textContent = String(active);
   }
@@ -517,25 +545,6 @@
   }
 
   function renderTasks() {
-    const query = el.searchInput.value.trim().toLocaleLowerCase("pt-BR");
-    const status = el.statusFilter.value;
-    const visibleJobs = state.jobs.filter(job => {
-      const haystack = `${job.name} ${job.description}`.toLocaleLowerCase("pt-BR");
-      return haystack.includes(query) && (status === "todas" || job.status === status);
-    });
-
-    visibleJobs.sort((left, right) => {
-      let compared = 0;
-      if (state.sort.key === "name") compared = left.name.localeCompare(right.name, "pt-BR");
-      if (state.sort.key === "schedule") compared = left.datetime.localeCompare(right.datetime);
-      if (state.sort.key === "status") compared = left.status.localeCompare(right.status) || left.name.localeCompare(right.name);
-      if (state.sort.key === "last") {
-        compared = (right.last_run || "").localeCompare(left.last_run || "");
-        if (compared === 0) compared = left.name.localeCompare(right.name);
-      }
-      return compared * state.sort.dir;
-    });
-
     $$(".sort-ind").forEach(indicator => {
       indicator.textContent = indicator.dataset.sortInd === state.sort.key
         ? (state.sort.dir === 1 ? "▲" : "▼")
@@ -543,31 +552,50 @@
       indicator.style.opacity = indicator.dataset.sortInd === state.sort.key ? "1" : "0.35";
     });
 
+    const { total, offset, q, status } = state.jobsPage;
+    const filtering = Boolean(q) || (status && status !== "todas");
+    if (!total) {
+      if (!getToken()) {
+        el.tasksSummary.textContent = "Conecte-se à API para carregar suas tarefas.";
+        el.jobsBody.innerHTML = `<tr><td colspan="5">
+          <div class="empty-state">
+            <div class="empty-icon" aria-hidden="true"><svg><use href="#i-tasks"/></svg></div>
+            <h3>Tudo pronto para começar</h3>
+            <p>Informe o token da API e crie sua primeira automação.</p>
+            <button class="button" type="button" data-action="create"><svg aria-hidden="true"><use href="#i-plus"/></svg>Criar tarefa</button>
+          </div>
+        </td></tr>`;
+      } else if (filtering) {
+        el.tasksSummary.textContent = "Nenhuma tarefa corresponde aos filtros atuais.";
+        el.jobsBody.innerHTML = `<tr><td class="table-message" colspan="5">Tente limpar a busca ou mudar o filtro de status.</td></tr>`;
+      } else {
+        el.tasksSummary.textContent = "Nenhuma tarefa encontrada.";
+        el.jobsBody.innerHTML = `<tr><td colspan="5">
+          <div class="empty-state">
+            <div class="empty-icon" aria-hidden="true"><svg><use href="#i-tasks"/></svg></div>
+            <h3>Nenhuma tarefa por aqui</h3>
+            <p>Crie sua primeira tarefa para automatizar uma rotina.</p>
+            <button class="button" type="button" data-action="create"><svg aria-hidden="true"><use href="#i-plus"/></svg>Criar tarefa</button>
+          </div>
+        </td></tr>`;
+      }
+      renderJobsPager();
+      return;
+    }
+
+    const start = state.jobs.length ? offset + 1 : 0;
+    const end = offset + state.jobs.length;
+    el.tasksSummary.textContent = total === state.jobs.length
+      ? `${total} tarefa${total === 1 ? "" : "s"} no workspace.`
+      : `Mostrando ${start}–${end} de ${total} tarefas.`;
+
     if (!state.jobs.length) {
-      el.tasksSummary.textContent = getToken()
-        ? "Nenhuma tarefa encontrada."
-        : "Conecte-se à API para carregar suas tarefas.";
-      el.jobsBody.innerHTML = `<tr><td colspan="5">
-        <div class="empty-state">
-          <div class="empty-icon" aria-hidden="true"><svg><use href="#i-tasks"/></svg></div>
-          <h3>${getToken() ? "Nenhuma tarefa por aqui" : "Tudo pronto para começar"}</h3>
-          <p>${getToken() ? "Crie sua primeira tarefa para automatizar uma rotina." : "Informe o token da API e crie sua primeira automação."}</p>
-          <button class="button" type="button" data-action="create"><svg aria-hidden="true"><use href="#i-plus"/></svg>Criar tarefa</button>
-        </div>
-      </td></tr>`;
+      el.jobsBody.innerHTML = `<tr><td class="table-message" colspan="5">Nenhuma tarefa nesta página.</td></tr>`;
+      renderJobsPager();
       return;
     }
 
-    el.tasksSummary.textContent = visibleJobs.length === state.jobs.length
-      ? `${state.jobs.length} tarefa${state.jobs.length === 1 ? "" : "s"} no workspace.`
-      : `Mostrando ${visibleJobs.length} de ${state.jobs.length} tarefas.`;
-
-    if (!visibleJobs.length) {
-      el.jobsBody.innerHTML = `<tr><td class="table-message" colspan="5">Nenhuma tarefa corresponde aos filtros atuais.</td></tr>`;
-      return;
-    }
-
-    el.jobsBody.innerHTML = visibleJobs.map((job, index) => {
+    el.jobsBody.innerHTML = state.jobs.map((job, index) => {
       const running = state.running.has(job.name);
       const statusClass = running ? "running" : job.status === "ativo" ? "active" : "inactive";
       const statusLabel = running ? "Executando" : job.status === "ativo" ? "Ativa" : "Desativa";
@@ -615,9 +643,36 @@
     }).join("");
   }
 
+  function renderJobsPager() {
+    const { total, offset, limit } = state.jobsPage;
+    const start = state.jobs.length ? offset + 1 : 0;
+    const end = offset + state.jobs.length;
+    el.jobsPage.textContent = `${start}–${end} de ${total}`;
+    el.jobsPrev.disabled = offset <= 0;
+    el.jobsNext.disabled = offset + limit >= total;
+  }
+
+  async function loadPickerJobs() {
+    if (!getToken()) {
+      state.pickerJobs = [];
+      renderLogJobList();
+      renderHistoryJobFilter();
+      return;
+    }
+    try {
+      const allJobs = await api("/api/jobs");
+      state.pickerJobs = Array.isArray(allJobs) ? allJobs : [];
+    } catch (_) {
+      /* mantém o picker anterior */
+    }
+    renderLogJobList();
+    renderHistoryJobFilter();
+  }
+
   function renderLogJobList() {
     const query = el.logJobSearch.value.trim().toLocaleLowerCase("pt-BR");
-    const jobs = state.jobs.filter(job => `${job.name} ${job.description}`.toLocaleLowerCase("pt-BR").includes(query));
+    const allJobs = state.pickerJobs.length ? state.pickerJobs : state.jobs;
+    const jobs = allJobs.filter(job => `${job.name} ${job.description}`.toLocaleLowerCase("pt-BR").includes(query));
     if (!jobs.length) {
       el.logJobList.innerHTML = `<p class="table-message">${getToken() ? "Nenhuma tarefa encontrada." : "Conecte-se para ver os logs."}</p>`;
       return;
@@ -696,10 +751,11 @@
 
   function renderHistoryJobFilter() {
     const current = state.history.job;
+    const allJobs = state.pickerJobs.length ? state.pickerJobs : state.jobs;
     const options = [`<option value="">Todas as tarefas</option>`]
-      .concat(state.jobs.map(job => `<option value="${escapeHtml(job.name)}">${escapeHtml(job.name)}</option>`));
+      .concat(allJobs.map(job => `<option value="${escapeHtml(job.name)}">${escapeHtml(job.name)}</option>`));
     el.historyJobFilter.innerHTML = options.join("");
-    if (current && state.jobs.some(job => job.name === current)) {
+    if (current && allJobs.some(job => job.name === current)) {
       el.historyJobFilter.value = current;
     } else if (current) {
       state.history.job = "";
@@ -787,7 +843,8 @@
     closeNav();
     if (name === "logs") {
       renderLogJobList();
-      if (!state.logs.job && state.jobs.length) selectLog(state.jobs[0].name);
+      const first = state.pickerJobs[0] || state.jobs[0];
+      if (!state.logs.job && first) selectLog(first.name);
       else if (state.logs.job) startLogPolling();
     } else {
       stopLogPolling();
@@ -796,6 +853,9 @@
     if (name === "historico") {
       renderHistoryJobFilter();
       loadHistory({ reset: true }).catch(() => { /* mantém a última visão */ });
+    }
+    if (name === "logs" || name === "historico") {
+      loadPickerJobs().catch(() => { /* mantém o picker anterior */ });
     }
   }
 
@@ -1610,6 +1670,8 @@
     state.running = new Set();
     state.info = null;
     state.loadedOnce = false;
+    state.jobsPage = { limit: 25, offset: 0, total: 0, q: "", status: "todas" };
+    state.pickerJobs = [];
     state.history.items = [];
     state.history.total = 0;
     state.history.offset = 0;
@@ -1617,6 +1679,8 @@
     setConnection("offline", "Informe o token da API");
     el.tokenInput.value = "";
     el.quickToken.value = "";
+    el.searchInput.value = "";
+    el.statusFilter.value = "todas";
     renderAll();
     toast("Sessão encerrada.", "info");
   }
@@ -1674,15 +1738,35 @@
       }
     });
 
-    el.searchInput.addEventListener("input", renderTasks);
-    el.statusFilter.addEventListener("change", renderTasks);
+    el.searchInput.addEventListener("input", () => {
+      state.jobsPage.q = el.searchInput.value.trim();
+      state.jobsPage.offset = 0;
+      clearTimeout(state.timers.search);
+      state.timers.search = setTimeout(() => {
+        refreshData({ silent: true }).catch(error => toast(error.message, "error"));
+      }, 250);
+    });
+    el.statusFilter.addEventListener("change", () => {
+      state.jobsPage.status = el.statusFilter.value;
+      state.jobsPage.offset = 0;
+      refreshData({ silent: true }).catch(error => toast(error.message, "error"));
+    });
     $$("th[data-sort]").forEach(cell => {
       cell.addEventListener("click", () => {
         const key = cell.dataset.sort;
         if (state.sort.key === key) state.sort.dir *= -1;
-        else { state.sort.key = key; state.sort.dir = 1; }
-        renderTasks();
+        else { state.sort.key = key; state.sort.dir = key === "last" ? -1 : 1; }
+        state.jobsPage.offset = 0;
+        refreshData({ silent: true }).catch(error => toast(error.message, "error"));
       });
+    });
+    el.jobsPrev.addEventListener("click", () => {
+      state.jobsPage.offset = Math.max(0, state.jobsPage.offset - state.jobsPage.limit);
+      refreshData({ silent: true }).catch(error => toast(error.message, "error"));
+    });
+    el.jobsNext.addEventListener("click", () => {
+      state.jobsPage.offset += state.jobsPage.limit;
+      refreshData({ silent: true }).catch(error => toast(error.message, "error"));
     });
 
     el.jobsBody.addEventListener("click", event => {
