@@ -34,6 +34,9 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   `sort`, `order`), usados também pelo painel.
 - Exportação e importação de jobs em JSON (`/api/jobs/export`,
   `/api/jobs/import`) com validação, prévia `dry_run` e modos `skip`/`overwrite`.
+- Backup automático do diretório de jobs em JSON, com escrita atômica,
+  validação, intervalo configurável e retenção (`backup_dir`,
+  `backup_interval_seconds`, `backup_retention`).
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

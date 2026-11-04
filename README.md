@@ -36,6 +36,10 @@ auth_lockout_seconds = 300
 trust_proxy_headers = false
 audit_log_file = "logs/audit.jsonl"
 history_file = "logs/history.jsonl"
+# Backup automático do diretório de jobs; "" desativa.
+backup_dir = "backups"
+backup_interval_seconds = 86400
+backup_retention = 7
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -70,6 +74,11 @@ O arquivo é `600` e rotaciona para `.1` em 5 MiB. Use `""` para desativar.
 origem, tentativa, resultado, exit code, duração e timeout). O arquivo é `600`,
 rotaciona para `.1` em 20 MiB e pode ser desativado com `""`; a API e o painel
 continuam funcionando com histórico vazio.
+
+`backup_dir` ativa backups periódicos do diretório de jobs no mesmo formato da
+exportação JSON; `""` desativa. `backup_interval_seconds` define o intervalo
+(padrão 24 h) e `backup_retention` quantos arquivos manter (`0` mantém todos).
+No `install`, caminhos relativos de backup são ancorados em `/var/lib/datatask`.
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -507,6 +516,29 @@ curl -X POST http://127.0.0.1:8080/api/jobs/import \
 A resposta contém `created`, `overwritten`, `skipped`, `total`, `mode` e
 `dry_run`. Jobs inválidos retornam `400` com a lista `errors` e nada é gravado.
 O painel usa prévia e oferece as opções **Sobrescrever** ou **Ignorar**.
+
+## Backups automáticos
+
+Com `backup_dir` configurado, o scheduler gera um backup JSON no início e a
+cada `backup_interval_seconds`. Cada arquivo:
+
+- contém `format`, `version`, `exported_at` e os campos configuráveis dos jobs;
+- é escrito em arquivo temporário `600`, validado por parse JSON e renomeado
+  atomicamente;
+- usa o nome `datatask-jobs-AAAAMMDD-HHMMSS.json`;
+- é podado para manter apenas os `backup_retention` mais recentes (`0` mantém
+  todos).
+
+O backup não inclui logs nem histórico de execuções. Para restaurar, use a
+importação JSON (prévia com `dry_run` e `on_conflict`):
+
+```bash
+ls -l backups/
+curl -X POST http://127.0.0.1:8080/api/jobs/import \
+  -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @backups/datatask-jobs-20261104-030000.json
+```
 
 ## Histórico de execuções
 

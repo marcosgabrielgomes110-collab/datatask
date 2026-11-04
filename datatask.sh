@@ -392,6 +392,9 @@ trusted_proxy_ips = []
 trust_proxy_headers = false
 audit_log_file = "logs/audit.jsonl"
 history_file = "logs/history.jsonl"
+backup_dir = ""
+backup_interval_seconds = 86400
+backup_retention = 7
 EOF
   umask "$old_umask"
 }
@@ -580,6 +583,8 @@ cmd_setup() {
   local prev_history prev_history_set=0
   local prev_trusted prev_trusted_set=0
   local prev_cert prev_cert_set=0 prev_key prev_key_set=0
+  local prev_backup_dir prev_backup_dir_set=0 prev_backup_interval prev_backup_interval_set=0
+  local prev_backup_retention prev_backup_retention_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -616,6 +621,18 @@ cmd_setup() {
   if grep -qE '^[[:space:]]*tls_key_file[[:space:]]*=' "$conf"; then
     prev_key="$(config_get "$conf" tls_key_file)"
     prev_key_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_dir[[:space:]]*=' "$conf"; then
+    prev_backup_dir="$(config_get "$conf" backup_dir)"
+    prev_backup_dir_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_interval_seconds[[:space:]]*=' "$conf"; then
+    prev_backup_interval="$(config_get "$conf" backup_interval_seconds)"
+    prev_backup_interval_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_retention[[:space:]]*=' "$conf"; then
+    prev_backup_retention="$(config_get "$conf" backup_retention)"
+    prev_backup_retention_set=1
   fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
@@ -684,6 +701,9 @@ cmd_setup() {
   [[ "$prev_history_set" -eq 1 ]] && config_set_string "$conf" history_file "$prev_history"
   [[ "$prev_cert_set" -eq 1 ]] && config_set_string "$conf" tls_cert_file "$prev_cert"
   [[ "$prev_key_set" -eq 1 ]] && config_set_string "$conf" tls_key_file "$prev_key"
+  [[ "$prev_backup_dir_set" -eq 1 ]] && config_set_string "$conf" backup_dir "$prev_backup_dir"
+  [[ "$prev_backup_interval_set" -eq 1 ]] && config_set_raw "$conf" backup_interval_seconds "$prev_backup_interval"
+  [[ "$prev_backup_retention_set" -eq 1 ]] && config_set_raw "$conf" backup_retention "$prev_backup_retention"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then
@@ -1073,6 +1093,11 @@ prepare_service_files() {
   fi
   jobs="${jobs:-$JOBS_DIR}"
   logs="${logs:-$LOGS_DIR}"
+
+  local backup; backup="$(config_get "$CONF_FILE" backup_dir)"
+  if [[ -n "$backup" && "$backup" != /* ]]; then
+    config_set_string "$CONF_FILE" backup_dir "${DATA_DIR}/${backup}"
+  fi
 
   local bind_addr tls_proxy trusted_raw native_cert native_key
   bind_addr="$(config_get "$CONF_FILE" bind_address)"

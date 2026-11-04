@@ -96,6 +96,13 @@ struct Config {
     /// JSONL execution history. Empty string disables it; omitted defaults to `<logs_dir>/history.jsonl`.
     #[serde(default)]
     history_file: Option<PathBuf>,
+    /// Directory for periodic JSON backups. Empty/omitted disables backups.
+    #[serde(default)]
+    backup_dir: Option<PathBuf>,
+    #[serde(default = "default_backup_interval_seconds")]
+    backup_interval_seconds: u64,
+    #[serde(default = "default_backup_retention")]
+    backup_retention: u32,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -128,6 +135,14 @@ fn default_notification_timeout_seconds() -> u64 {
 
 fn default_retry_delay_seconds() -> u64 {
     5
+}
+
+fn default_backup_interval_seconds() -> u64 {
+    86_400
+}
+
+fn default_backup_retention() -> u32 {
+    7
 }
 
 fn default_job_version() -> u64 {
@@ -716,6 +731,102 @@ fn filter_history(
     let total = filtered.len();
     let items = filtered.into_iter().skip(offset).take(limit).collect();
     (items, total)
+}
+
+fn write_backup(dir: &FsPath, retention: u32, jobs: &[Job]) -> Result<PathBuf, String> {
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("Cannot create backup dir {}: {error}", dir.display()))?;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let portable: Vec<PortableJob> = jobs.iter().map(PortableJob::from).collect();
+    let document = json!({
+        "format": "datatask.jobs",
+        "version": 1,
+        "exported_at": Local::now().to_rfc3339(),
+        "jobs": portable,
+    });
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| format!("Cannot serialize backup: {error}"))?;
+    serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Generated backup is invalid: {error}"))?;
+
+    let filename = format!(
+        "datatask-jobs-{}.json",
+        Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let path = dir.join(&filename);
+    let temporary = dir.join(format!(".{filename}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| format!("Cannot write backup: {error}"))?;
+    let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
+    file.write_all(text.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Cannot write backup: {error}"))?;
+    drop(file);
+    fs::rename(&temporary, &path).map_err(|error| format!("Cannot finalize backup: {error}"))?;
+    prune_backups(dir, retention)?;
+    Ok(path)
+}
+
+fn prune_backups(dir: &FsPath, retention: u32) -> Result<(), String> {
+    if retention == 0 {
+        return Ok(());
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Cannot list backups: {error}")),
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("datatask-jobs-") && name.ends_with(".json"))
+        })
+        .collect();
+    files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    let remove = files.len().saturating_sub(retention as usize);
+    for path in files.into_iter().take(remove) {
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!("Cannot remove old backup {}: {error}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_backup(state: &AppState) {
+    let Some(dir) = &state.config.backup_dir else {
+        return;
+    };
+    let jobs = match list_jobs_cached(&state.config, &state.job_cache) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("Cannot collect jobs for backup: {}", error.1);
+            return;
+        }
+    };
+    match write_backup(dir, state.config.backup_retention, &jobs) {
+        Ok(path) => state.audit(json!({
+            "ts": Local::now().to_rfc3339(),
+            "event": "backup.created",
+            "path": path.display().to_string(),
+            "jobs": jobs.len(),
+        })),
+        Err(error) => {
+            eprintln!("Backup failed: {error}");
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.error",
+                "error": error,
+            }));
+        }
+    }
 }
 
 fn client_ip(state: &AppState, request: &Request<Body>) -> IpAddr {
@@ -1328,6 +1439,12 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         Some(path) if path.is_relative() => Some(base.join(path)),
         Some(path) => Some(path),
     };
+    config.backup_dir = match config.backup_dir.take() {
+        None => None,
+        Some(path) if path.as_os_str().is_empty() => None,
+        Some(path) if path.is_relative() => Some(base.join(path)),
+        Some(path) => Some(path),
+    };
     for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
         if let Some(path) = path
             && path.is_relative()
@@ -1356,6 +1473,17 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     }
     if config.max_concurrent_jobs == 0 {
         return Err("max_concurrent_jobs must be greater than zero.".to_owned());
+    }
+    if let Some(backup_dir) = &config.backup_dir {
+        if config.backup_interval_seconds == 0 {
+            return Err("backup_interval_seconds must be greater than zero.".to_owned());
+        }
+        if config.backup_retention > 365 {
+            return Err("backup_retention must be between 0 and 365.".to_owned());
+        }
+        if backup_dir == &config.jobs_dir {
+            return Err("backup_dir must be different from jobs_dir.".to_owned());
+        }
     }
     if config.auth_failure_limit > 0 && config.auth_failure_window_seconds == 0 {
         return Err("auth_failure_window_seconds must be greater than zero.".to_owned());
@@ -3197,6 +3325,14 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "logs_dir": state.config.logs_dir.display().to_string(),
         "job_count": jobs.len(),
         "history_enabled": state.history.is_some(),
+        "backup_enabled": state.config.backup_dir.is_some(),
+        "backup_dir": state
+            .config
+            .backup_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "backup_interval_seconds": state.config.backup_interval_seconds,
+        "backup_retention": state.config.backup_retention,
         "active_count": active_count,
         "recurring_count": recurring_count,
         "executed_today_count": executed_today_count,
@@ -3231,6 +3367,7 @@ async fn script() -> impl IntoResponse {
 async fn scheduler(state: Arc<AppState>) {
     let interval = Duration::from_secs(state.config.poll_interval_seconds);
     let mut ticker = time::interval(interval);
+    let mut last_backup: Option<Instant> = None;
     loop {
         ticker.tick().await;
         *state
@@ -3293,6 +3430,15 @@ async fn scheduler(state: Arc<AppState>) {
                 }
                 Ok(false) => {}
                 Err(error) => eprintln!("Invalid schedule for '{}': {}", job.name, error.1),
+            }
+        }
+        if state.config.backup_dir.is_some() {
+            let due = last_backup.is_none_or(|last| {
+                last.elapsed() >= Duration::from_secs(state.config.backup_interval_seconds)
+            });
+            if due {
+                last_backup = Some(Instant::now());
+                run_backup(&state);
             }
         }
     }
@@ -3364,6 +3510,18 @@ fn prepare_storage(config: &Config) -> std::io::Result<()> {
         }] {
             if path.is_file() {
                 let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    if let Some(backup_dir) = &config.backup_dir {
+        fs::create_dir_all(backup_dir)?;
+        let _ = fs::set_permissions(backup_dir, fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = fs::read_dir(backup_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+                }
             }
         }
     }
@@ -3854,6 +4012,41 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].job, "alpha");
         assert_eq!(records[0].duration_ms, 42);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn writes_and_prunes_automatic_backups() {
+        let directory = std::env::temp_dir().join(format!(
+            "datatask-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        for stamp in ["20260101-000000", "20260102-000000", "20260103-000000"] {
+            fs::write(directory.join(format!("datatask-jobs-{stamp}.json")), "{}").unwrap();
+        }
+        fs::write(directory.join("unrelated.txt"), "keep").unwrap();
+        let path = write_backup(&directory, 2, &[]).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        let document: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(document["format"], "datatask.jobs");
+        assert_eq!(document["jobs"].as_array().unwrap().len(), 0);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let mut backups: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("datatask-jobs-"))
+            .collect();
+        backups.sort();
+        assert_eq!(backups.len(), 2);
+        assert!(directory.join("unrelated.txt").is_file());
         let _ = fs::remove_dir_all(&directory);
     }
 

@@ -55,5 +55,7 @@ advisory com crédito, se desejado.
 - A exportação inclui `action` e `notify_url` dos jobs, que podem conter
   segredos. Trate o JSON exportado como credencial (`600`) e não o publique.
   A importação pode sobrescrever jobs existentes; revise a prévia antes.
+- Backups automáticos também contêm `action`/`notify_url`; mantenha
+  `backup_dir` em `700` e os arquivos em `600`, com retenção limitada.
 - Se você encontrar token em log, histórico de shell, issue ou commit, rotacione
   imediatamente e remova o segredo do histórico.

@@ -716,6 +716,7 @@
       ["X-Forwarded-For", info.trust_proxy_headers ? "confiado" : "ignorado"],
       ["Proxies confiáveis", info.trusted_proxy_ips?.length ? info.trusted_proxy_ips.join(", ") : "somente loopback"],
       ["Métricas", "/metrics (loopback ou token)"],
+      ["Backup", info.backup_enabled ? `${info.backup_dir} · a cada ${info.backup_interval_seconds}s · ${info.backup_retention} cópias` : "desativado"],
       ["Tarefas cadastradas", String(info.job_count)],
       ["Tarefas ativas", String(info.active_count)],
       ["Executando agora", running ? `${running} (${info.running.join(", ")})` : "nenhuma"],
