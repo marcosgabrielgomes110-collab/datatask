@@ -402,6 +402,10 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
 - `GET /api/history?job=&result=&limit=&offset=` — tentativas persistidas, mais
   recentes primeiro; `result` aceita `success`, `error` ou `timeout`; `limit`
   padrão 50 (máx. 200)
+- `GET /api/backups` — lista backups automáticos com tamanho, data, contagem de
+  jobs e status do checksum SHA-256
+- `GET /api/backups/{name}` — baixa um backup somente se o checksum conferir
+  (`409` se ausente/divergente)
 - `GET /api/jobs` — lista completa (array); com `?limit=&offset=&q=&status=&sort=&order=`
   retorna `{items,total,limit,offset}` (`limit` padrão 50, máximo 500).
   `sort` aceita `name`, `schedule`, `status` ou `last`; `order` é `asc`/`desc`.
@@ -526,18 +530,25 @@ cada `backup_interval_seconds`. Cada arquivo:
 - é escrito em arquivo temporário `600`, validado por parse JSON e renomeado
   atomicamente;
 - usa o nome `datatask-jobs-AAAAMMDD-HHMMSS.json`;
+- gera um sidecar `...json.sha256` (formato `sha256sum`);
 - é podado para manter apenas os `backup_retention` mais recentes (`0` mantém
-  todos).
+  todos), removendo também o sidecar correspondente.
 
-O backup não inclui logs nem histórico de execuções. Para restaurar, use a
-importação JSON (prévia com `dry_run` e `on_conflict`):
+O backup não inclui logs nem histórico de execuções. A tela **Configurações →
+Backups** lista os arquivos, mostra o status do checksum e permite restaurar
+com prévia do que será criado/sobrescrito; backups com checksum ausente ou
+divergente ficam bloqueados. A restauração também pode ser feita pela API:
 
 ```bash
 ls -l backups/
+curl -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
+  http://127.0.0.1:8080/api/backups
+curl -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
+  -o restore.json http://127.0.0.1:8080/api/backups/datatask-jobs-20261104-030000.json
 curl -X POST http://127.0.0.1:8080/api/jobs/import \
   -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
   -H 'Content-Type: application/json' \
-  --data-binary @backups/datatask-jobs-20261104-030000.json
+  --data-binary @restore.json
 ```
 
 ## Histórico de execuções

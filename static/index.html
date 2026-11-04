@@ -374,6 +374,36 @@
               <div class="info-empty">Conecte-se para ver as informações do servidor.</div>
             </div>
           </section>
+
+          <section class="card span-2">
+            <header class="card-head">
+              <div>
+                <h2>Backups</h2>
+                <p id="backupsSummary">Restauração guiada com verificação SHA-256.</p>
+              </div>
+              <button class="button outline small" id="backupsRefresh" type="button">
+                <svg aria-hidden="true"><use href="#i-refresh"/></svg>
+                Atualizar
+              </button>
+            </header>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Quando</th>
+                    <th>Arquivo</th>
+                    <th>Jobs</th>
+                    <th>Checksum</th>
+                    <th>Tamanho</th>
+                    <th style="text-align:right">Ação</th>
+                  </tr>
+                </thead>
+                <tbody id="backupsBody">
+                  <tr><td class="table-message" colspan="6">Conecte-se para listar os backups.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
         </div>
       </section>
     </main>

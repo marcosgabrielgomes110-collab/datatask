@@ -95,6 +95,9 @@
     prefWrap: $("#prefWrap"),
     infoRefresh: $("#infoRefresh"),
     serverInfo: $("#serverInfo"),
+    backupsRefresh: $("#backupsRefresh"),
+    backupsSummary: $("#backupsSummary"),
+    backupsBody: $("#backupsBody"),
     jobDialog: $("#jobDialog"),
     jobForm: $("#jobForm"),
     formTitle: $("#formTitle"),
@@ -743,6 +746,7 @@
   /* ---------------------------------------------------------------------- */
 
   function formatHistoryTime(value) {
+    if (!value) return "—";
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value ?? "—");
     return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
@@ -858,7 +862,10 @@
     } else {
       stopLogPolling();
     }
-    if (name === "config") renderServerInfo();
+    if (name === "config") {
+      renderServerInfo();
+      loadBackups().catch(() => { /* mantém a última visão */ });
+    }
     if (name === "historico") {
       renderHistoryJobFilter();
       loadHistory({ reset: true }).catch(() => { /* mantém a última visão */ });
@@ -1342,6 +1349,80 @@
   /* Ações de tarefa                                                        */
   /* ---------------------------------------------------------------------- */
 
+  async function loadBackups() {
+    if (!getToken()) {
+      el.backupsSummary.textContent = "Conecte-se para listar os backups.";
+      el.backupsBody.innerHTML = `<tr><td class="table-message" colspan="6">Conecte-se para listar os backups.</td></tr>`;
+      return;
+    }
+    try {
+      const data = await api("/api/backups");
+      renderBackups(data);
+    } catch (error) {
+      el.backupsSummary.textContent = error.message;
+      el.backupsBody.innerHTML = `<tr><td class="table-message" colspan="6">${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
+  function renderBackups(data) {
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (!data.enabled) {
+      el.backupsSummary.textContent = "Backups automáticos desativados (configure backup_dir).";
+    } else {
+      el.backupsSummary.textContent = items.length
+        ? `${items.length} backup(s) em ${data.dir}. Restauração usa prévia e verificação SHA-256.`
+        : `Nenhum backup em ${data.dir}.`;
+    }
+    if (!items.length) {
+      el.backupsBody.innerHTML = `<tr><td class="table-message" colspan="6">${escapeHtml(
+        data.enabled ? "Nenhum backup encontrado." : "Backups automáticos desativados."
+      )}</td></tr>`;
+      return;
+    }
+    el.backupsBody.innerHTML = items.map(item => {
+      const checksum = item.checksum_ok
+        ? `<span class="result-badge result-success"><svg aria-hidden="true"><use href="#i-check"/></svg>OK</span>`
+        : `<span class="result-badge result-error"><svg aria-hidden="true"><use href="#i-alert"/></svg>${item.sha256 ? "Divergente" : "Ausente"}</span>`;
+      const disabled = !item.checksum_ok || !item.valid_json;
+      return `<tr>
+        <td>${escapeHtml(formatHistoryTime(item.modified))}</td>
+        <td><code>${escapeHtml(item.name)}</code></td>
+        <td>${item.jobs}</td>
+        <td>${checksum}</td>
+        <td>${escapeHtml(formatBytes(item.size))}</td>
+        <td style="text-align:right">
+          <button class="button outline small" type="button" data-backup="${escapeHtml(item.name)}" ${disabled ? "disabled" : ""}>
+            Restaurar
+          </button>
+        </td>
+      </tr>`;
+    }).join("");
+  }
+
+  async function restoreBackup(name) {
+    const token = getToken();
+    if (!token) {
+      toast("Conecte-se à API para restaurar.", "error");
+      return;
+    }
+    try {
+      const response = await fetch(`/api/backups/${encodeURIComponent(name)}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        if (response.status === 401) {
+          setToken("");
+          setConnection("offline", "Token inválido");
+        }
+        throw new Error(`Erro HTTP ${response.status}`);
+      }
+      const imported = await response.json();
+      await importJobsDocument(imported);
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
   async function exportJobs() {
     const token = getToken();
     if (!token) {
@@ -1394,6 +1475,10 @@
       toast("O arquivo não contém uma lista 'jobs'.", "error");
       return;
     }
+    await importJobsDocument(imported);
+  }
+
+  async function importJobsDocument(imported) {
     try {
       const preview = await api("/api/jobs/import", {
         method: "POST",
@@ -1447,6 +1532,9 @@
       await refreshData({ silent: true });
       if (state.view === "logs" || state.view === "historico") {
         await loadPickerJobs();
+      }
+      if (state.view === "config") {
+        await loadBackups();
       }
     } catch (error) {
       toast(error.message, "error");
@@ -1801,6 +1889,8 @@
     el.quickToken.value = "";
     el.searchInput.value = "";
     el.statusFilter.value = "todas";
+    el.backupsSummary.textContent = "Conecte-se para listar os backups.";
+    el.backupsBody.innerHTML = `<tr><td class="table-message" colspan="6">Conecte-se para listar os backups.</td></tr>`;
     renderAll();
     toast("Sessão encerrada.", "info");
   }
@@ -1852,10 +1942,19 @@
       if (!getToken()) { toast("Conecte-se para consultar o servidor.", "error"); return; }
       try {
         await refreshData({ silent: true });
+        await loadBackups();
         toast("Informações atualizadas.", "success");
       } catch (error) {
         toast(error.message, "error");
       }
+    });
+    el.backupsRefresh.addEventListener("click", () => {
+      loadBackups().catch(error => toast(error.message, "error"));
+    });
+    el.backupsBody.addEventListener("click", event => {
+      const button = event.target.closest("button[data-backup]");
+      if (!button || button.disabled) return;
+      restoreBackup(button.dataset.backup).catch(error => toast(error.message, "error"));
     });
 
     el.exportJobs.addEventListener("click", exportJobs);

@@ -37,6 +37,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 - Backup automático do diretório de jobs em JSON, com escrita atômica,
   validação, intervalo configurável e retenção (`backup_dir`,
   `backup_interval_seconds`, `backup_retention`).
+- Sidecar SHA-256 dos backups, listagem/verificação via `/api/backups` e
+  restauração guiada no painel com bloqueio de arquivos corrompidos.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

@@ -56,6 +56,8 @@ advisory com crédito, se desejado.
   segredos. Trate o JSON exportado como credencial (`600`) e não o publique.
   A importação pode sobrescrever jobs existentes; revise a prévia antes.
 - Backups automáticos também contêm `action`/`notify_url`; mantenha
-  `backup_dir` em `700` e os arquivos em `600`, com retenção limitada.
+  `backup_dir` em `700` e os arquivos em `600`, com retenção limitada. O
+  sidecar `.sha256` detecta corrupção/tampering, mas não substitui permissões
+  nem criptografia de disco.
 - Se você encontrar token em log, histórico de shell, issue ou commit, rotacione
   imediatamente e remova o segredo do histórico.

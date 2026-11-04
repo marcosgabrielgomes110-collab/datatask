@@ -733,7 +733,16 @@ fn filter_history(
     (items, total)
 }
 
-fn write_backup(dir: &FsPath, retention: u32, jobs: &[Job]) -> Result<PathBuf, String> {
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn write_backup(dir: &FsPath, retention: u32, jobs: &[Job]) -> Result<(PathBuf, String), String> {
     fs::create_dir_all(dir)
         .map_err(|error| format!("Cannot create backup dir {}: {error}", dir.display()))?;
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
@@ -748,6 +757,7 @@ fn write_backup(dir: &FsPath, retention: u32, jobs: &[Job]) -> Result<PathBuf, S
         .map_err(|error| format!("Cannot serialize backup: {error}"))?;
     serde_json::from_str::<Value>(&text)
         .map_err(|error| format!("Generated backup is invalid: {error}"))?;
+    let checksum = sha256_hex(text.as_bytes());
 
     let filename = format!(
         "datatask-jobs-{}.json",
@@ -768,8 +778,27 @@ fn write_backup(dir: &FsPath, retention: u32, jobs: &[Job]) -> Result<PathBuf, S
         .map_err(|error| format!("Cannot write backup: {error}"))?;
     drop(file);
     fs::rename(&temporary, &path).map_err(|error| format!("Cannot finalize backup: {error}"))?;
+
+    let checksum_path = dir.join(format!("{filename}.sha256"));
+    let checksum_temporary = dir.join(format!(".{filename}.sha256.tmp"));
+    let mut checksum_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&checksum_temporary)
+        .map_err(|error| format!("Cannot write backup checksum: {error}"))?;
+    let _ = fs::set_permissions(&checksum_temporary, fs::Permissions::from_mode(0o600));
+    checksum_file
+        .write_all(format!("{checksum}  {filename}\n").as_bytes())
+        .and_then(|_| checksum_file.sync_all())
+        .map_err(|error| format!("Cannot write backup checksum: {error}"))?;
+    drop(checksum_file);
+    fs::rename(&checksum_temporary, &checksum_path)
+        .map_err(|error| format!("Cannot finalize backup checksum: {error}"))?;
+
     prune_backups(dir, retention)?;
-    Ok(path)
+    Ok((path, checksum))
 }
 
 fn prune_backups(dir: &FsPath, retention: u32) -> Result<(), String> {
@@ -796,6 +825,9 @@ fn prune_backups(dir: &FsPath, retention: u32) -> Result<(), String> {
         if let Err(error) = fs::remove_file(&path) {
             eprintln!("Cannot remove old backup {}: {error}", path.display());
         }
+        let mut checksum = path.as_os_str().to_owned();
+        checksum.push(".sha256");
+        let _ = fs::remove_file(PathBuf::from(checksum));
     }
     Ok(())
 }
@@ -812,11 +844,12 @@ fn run_backup(state: &AppState) {
         }
     };
     match write_backup(dir, state.config.backup_retention, &jobs) {
-        Ok(path) => state.audit(json!({
+        Ok((path, checksum)) => state.audit(json!({
             "ts": Local::now().to_rfc3339(),
             "event": "backup.created",
             "path": path.display().to_string(),
             "jobs": jobs.len(),
+            "sha256": checksum,
         })),
         Err(error) => {
             eprintln!("Backup failed: {error}");
@@ -827,6 +860,160 @@ fn run_backup(state: &AppState) {
             }));
         }
     }
+}
+
+#[derive(Serialize)]
+struct BackupInfo {
+    name: String,
+    size: u64,
+    modified: Option<String>,
+    sha256: Option<String>,
+    checksum_ok: bool,
+    valid_json: bool,
+    jobs: usize,
+}
+
+fn checksum_path(path: &FsPath) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".sha256");
+    PathBuf::from(value)
+}
+
+fn expected_checksum(path: &FsPath) -> Option<String> {
+    let text = fs::read_to_string(checksum_path(path)).ok()?;
+    text.split_whitespace().next().map(str::to_owned)
+}
+
+fn valid_backup_name(name: &str) -> bool {
+    name.len() <= 128
+        && name.starts_with("datatask-jobs-")
+        && name.ends_with(".json")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn backup_info(dir: &FsPath, name: &str) -> Result<BackupInfo, String> {
+    let path = dir.join(name);
+    let metadata =
+        fs::metadata(&path).map_err(|error| format!("Cannot inspect backup: {error}"))?;
+    let data = fs::read(&path).map_err(|error| format!("Cannot read backup: {error}"))?;
+    let actual = sha256_hex(&data);
+    let expected = expected_checksum(&path);
+    let checksum_ok = expected
+        .as_deref()
+        .is_some_and(|checksum| checksum.eq_ignore_ascii_case(&actual));
+    let parsed = serde_json::from_slice::<Value>(&data);
+    let (valid_json, jobs) = match &parsed {
+        Ok(document) => (
+            true,
+            document
+                .get("jobs")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        ),
+        Err(_) => (false, 0),
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .map(|time| DateTime::<Local>::from(time).to_rfc3339());
+    Ok(BackupInfo {
+        name: name.to_owned(),
+        size: metadata.len(),
+        modified,
+        sha256: expected,
+        checksum_ok,
+        valid_json,
+        jobs,
+    })
+}
+
+fn list_backup_infos(config: &Config) -> Result<Vec<BackupInfo>, String> {
+    let Some(dir) = &config.backup_dir else {
+        return Ok(Vec::new());
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("Cannot list backups: {error}")),
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| valid_backup_name(name))
+        .collect();
+    names.sort_by(|left, right| right.cmp(left));
+    names.truncate(100);
+    let mut items = Vec::new();
+    for name in names {
+        match backup_info(dir, &name) {
+            Ok(info) => items.push(info),
+            Err(error) => eprintln!("Cannot inspect backup '{name}': {error}"),
+        }
+    }
+    Ok(items)
+}
+
+async fn get_backups(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let items = list_backup_infos(&state.config)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(json!({
+        "enabled": state.config.backup_dir.is_some(),
+        "dir": state
+            .config
+            .backup_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "items": items,
+    })))
+}
+
+async fn get_backup_file(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    if !valid_backup_name(&name) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Invalid backup name."));
+    }
+    let Some(dir) = &state.config.backup_dir else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Backups are disabled."));
+    };
+    let path = dir.join(&name);
+    let data = fs::read(&path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => api_error(StatusCode::NOT_FOUND, "Backup not found."),
+        _ => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cannot read backup: {error}"),
+        ),
+    })?;
+    let actual = sha256_hex(&data);
+    let Some(expected) = expected_checksum(&path) else {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Backup checksum file is missing.",
+        ));
+    };
+    if !expected.eq_ignore_ascii_case(&actual) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Backup checksum does not match.",
+        ));
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Invalid filename."))?,
+    );
+    if let Ok(value) = HeaderValue::from_str(&actual) {
+        headers.insert(HeaderName::from_static("x-checksum-sha256"), value);
+    }
+    Ok((headers, data).into_response())
 }
 
 fn client_ip(state: &AppState, request: &Request<Body>) -> IpAddr {
@@ -3651,6 +3838,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api: Router = Router::new()
         .route("/api/info", get(get_info))
         .route("/api/history", get(get_history))
+        .route("/api/backups", get(get_backups))
+        .route("/api/backups/{name}", get(get_backup_file))
         .route("/api/jobs", get(get_jobs).post(create_job))
         .route("/api/jobs/export", get(export_jobs))
         .route("/api/jobs/import", post(import_jobs))
@@ -4016,6 +4205,18 @@ mod tests {
     }
 
     #[test]
+    fn validates_backup_names_and_checksums() {
+        assert!(valid_backup_name("datatask-jobs-20260101-000000.json"));
+        assert!(!valid_backup_name("../datatask-jobs-x.json"));
+        assert!(!valid_backup_name("other.json"));
+        assert_eq!(sha256_hex(b"abc").len(), 64);
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn writes_and_prunes_automatic_backups() {
         let directory = std::env::temp_dir().join(format!(
             "datatask-backup-{}-{}",
@@ -4030,19 +4231,25 @@ mod tests {
             fs::write(directory.join(format!("datatask-jobs-{stamp}.json")), "{}").unwrap();
         }
         fs::write(directory.join("unrelated.txt"), "keep").unwrap();
-        let path = write_backup(&directory, 2, &[]).unwrap();
+        let (path, checksum) = write_backup(&directory, 2, &[]).unwrap();
+        assert_eq!(checksum.len(), 64);
         let contents = fs::read_to_string(&path).unwrap();
         let document: Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(document["format"], "datatask.jobs");
         assert_eq!(document["jobs"].as_array().unwrap().len(), 0);
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let mut checksum_path = path.as_os_str().to_owned();
+        checksum_path.push(".sha256");
+        let checksum_path = PathBuf::from(checksum_path);
+        let checksum_text = fs::read_to_string(&checksum_path).unwrap();
+        assert!(checksum_text.starts_with(&checksum));
 
         let mut backups: Vec<String> = fs::read_dir(&directory)
             .unwrap()
             .flatten()
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| name.starts_with("datatask-jobs-"))
+            .filter(|name| name.starts_with("datatask-jobs-") && name.ends_with(".json"))
             .collect();
         backups.sort();
         assert_eq!(backups.len(), 2);
