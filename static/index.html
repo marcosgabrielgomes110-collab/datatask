@@ -32,6 +32,7 @@
       <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11.5" height="11.5" rx="2"/><path d="M6 15H4.5v-10a1 1 0 0 1 1-1h10V6"/></symbol>
       <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13"/><path d="M10 11v5.5M14 11v5.5"/></symbol>
       <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7.5 10.5L12 15l4.5-4.5"/><path d="M4.5 20h15"/></symbol>
+      <symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V9"/><path d="M7.5 13.5L12 9l4.5 4.5"/><path d="M4.5 4h15"/></symbol>
       <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.3-4.3"/></symbol>
       <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></symbol>
       <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"/></symbol>
@@ -149,6 +150,13 @@
             <p class="section-sub" id="tasksSummary">Gerencie seus comandos agendados em um só lugar.</p>
           </div>
           <div class="toolbar-group">
+            <button class="button outline icon-only" id="exportJobs" type="button" title="Exportar jobs" aria-label="Exportar jobs">
+              <svg aria-hidden="true"><use href="#i-download"/></svg>
+            </button>
+            <button class="button outline icon-only" id="importJobs" type="button" title="Importar jobs" aria-label="Importar jobs">
+              <svg aria-hidden="true"><use href="#i-upload"/></svg>
+            </button>
+            <input id="importFile" type="file" accept="application/json,.json" hidden>
             <div class="search-box">
               <svg aria-hidden="true"><use href="#i-search"/></svg>
               <input id="searchInput" type="search" placeholder="Buscar tarefa…" aria-label="Buscar tarefa">

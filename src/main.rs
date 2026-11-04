@@ -968,6 +968,62 @@ struct Job {
     last_duration_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PortableJob {
+    name: String,
+    #[serde(default)]
+    description: String,
+    datetime: String,
+    action: String,
+    #[serde(default = "default_active_status")]
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    retries: u32,
+    #[serde(default = "default_retry_delay_seconds")]
+    retry_delay_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notify_url: Option<String>,
+}
+
+impl From<&Job> for PortableJob {
+    fn from(job: &Job) -> Self {
+        Self {
+            name: job.name.clone(),
+            description: job.description.clone(),
+            datetime: job.datetime.clone(),
+            action: job.action.clone(),
+            status: job.status.clone(),
+            working_dir: job.working_dir.clone(),
+            timeout_seconds: job.timeout_seconds,
+            retries: job.retries,
+            retry_delay_seconds: job.retry_delay_seconds,
+            notify_url: job.notify_url.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct JobsImport {
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default)]
+    jobs: Vec<PortableJob>,
+    #[serde(default)]
+    on_conflict: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn default_active_status() -> String {
+    "ativo".to_owned()
+}
+
 /// Outcome of a single command execution, used to record run history.
 struct RunOutcome {
     exit_code: Option<i32>,
@@ -2007,6 +2063,189 @@ async fn dashboard() -> impl IntoResponse {
         [(header::CACHE_CONTROL, "no-store")],
         Html(include_str!("../static/index.html")),
     )
+}
+
+fn portable_job_to_job(portable: &PortableJob) -> Result<Job, String> {
+    if !valid_job_name(&portable.name) {
+        return Err("Job name must contain only letters, numbers, '-' or '_'.".to_owned());
+    }
+    validate_schedule(&portable.datetime).map_err(|error| error.1)?;
+    validate_text_length("description", &portable.description, MAX_DESCRIPTION_BYTES)
+        .map_err(|error| error.1)?;
+    validate_text_length("datetime", &portable.datetime, MAX_DATETIME_BYTES)
+        .map_err(|error| error.1)?;
+    validate_text_length("action", &portable.action, MAX_ACTION_BYTES).map_err(|error| error.1)?;
+    if portable.action.trim().is_empty() {
+        return Err("action cannot be empty.".to_owned());
+    }
+    let status = normalize_status(&portable.status).map_err(|error| error.1)?;
+    let working_dir =
+        normalize_working_dir(portable.working_dir.as_deref()).map_err(|error| error.1)?;
+    let timeout_seconds =
+        normalize_timeout(portable.timeout_seconds.unwrap_or(0)).map_err(|error| error.1)?;
+    let retries = normalize_retries(portable.retries).map_err(|error| error.1)?;
+    let retry_delay_seconds =
+        normalize_retry_delay(portable.retry_delay_seconds).map_err(|error| error.1)?;
+    let notify_url =
+        normalize_notify_url(portable.notify_url.as_deref()).map_err(|error| error.1)?;
+    Ok(Job {
+        name: portable.name.clone(),
+        description: portable.description.clone(),
+        datetime: portable.datetime.trim().to_owned(),
+        action: portable.action.clone(),
+        log: format!("logs/{}.log", portable.name),
+        status,
+        version: 1,
+        last_run: None,
+        working_dir,
+        timeout_seconds,
+        retries,
+        retry_delay_seconds,
+        notify_url,
+        last_result: None,
+        last_exit_code: None,
+        last_duration_ms: None,
+    })
+}
+
+async fn export_jobs(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
+    let jobs = list_jobs_cached(&state.config, &state.job_cache)?;
+    let portable: Vec<PortableJob> = jobs.iter().map(PortableJob::from).collect();
+    let document = json!({
+        "format": "datatask.jobs",
+        "version": 1,
+        "exported_at": Local::now().to_rfc3339(),
+        "jobs": portable,
+    });
+    let filename = format!(
+        "datatask-jobs-{}.json",
+        Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Invalid filename."))?,
+    );
+    Ok((headers, Json(document)).into_response())
+}
+
+async fn import_jobs(
+    State(state): State<Arc<AppState>>,
+    Json(document): Json<JobsImport>,
+) -> ApiResult<Response> {
+    if let Some(format) = document.format.as_deref()
+        && format != "datatask.jobs"
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported import format.",
+        ));
+    }
+    if document.version.unwrap_or(1) != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported import version.",
+        ));
+    }
+    let on_conflict = document.on_conflict.as_deref().unwrap_or("skip");
+    if !matches!(on_conflict, "skip" | "overwrite") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "on_conflict must be 'skip' or 'overwrite'.",
+        ));
+    }
+    if document.jobs.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Import contains no jobs.",
+        ));
+    }
+    if document.jobs.len() > 1000 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Import is limited to 1000 jobs.",
+        ));
+    }
+
+    let _guard = state.repository_lock.lock().await;
+    let mut prepared = Vec::with_capacity(document.jobs.len());
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+    for (index, portable) in document.jobs.iter().enumerate() {
+        match portable_job_to_job(portable) {
+            Ok(job) => {
+                if !seen.insert(job.name.clone()) {
+                    errors.push(json!({
+                        "index": index,
+                        "name": job.name,
+                        "error": "duplicate job name in import.",
+                    }));
+                } else {
+                    prepared.push(job);
+                }
+            }
+            Err(error) => errors.push(json!({
+                "index": index,
+                "name": portable.name,
+                "error": error,
+            })),
+        }
+    }
+    if !errors.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Import contains invalid jobs.",
+                "errors": errors,
+            })),
+        )
+            .into_response());
+    }
+
+    let mut created = Vec::new();
+    let mut overwritten = Vec::new();
+    let mut skipped = Vec::new();
+    for job in prepared {
+        let path = job_path(&state.config, &job.name)?;
+        let exists = path.is_file();
+        let job = if exists {
+            if on_conflict == "skip" {
+                skipped.push(job.name);
+                continue;
+            }
+            let mut merged = job;
+            if let Ok(existing) = read_job(&state.config, &merged.name) {
+                merged.last_run = existing.last_run;
+                merged.last_result = existing.last_result;
+                merged.last_exit_code = existing.last_exit_code;
+                merged.last_duration_ms = existing.last_duration_ms;
+                merged.version = existing.version.saturating_add(1);
+            }
+            overwritten.push(merged.name.clone());
+            merged
+        } else {
+            created.push(job.name.clone());
+            job
+        };
+        if !document.dry_run {
+            write_job(&state.config, &job)?;
+        }
+    }
+
+    Ok(Json(json!({
+        "dry_run": document.dry_run,
+        "mode": on_conflict,
+        "total": document.jobs.len(),
+        "created": created,
+        "overwritten": overwritten,
+        "skipped": skipped,
+    }))
+    .into_response())
 }
 
 async fn get_jobs(
@@ -3255,6 +3494,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/info", get(get_info))
         .route("/api/history", get(get_history))
         .route("/api/jobs", get(get_jobs).post(create_job))
+        .route("/api/jobs/export", get(export_jobs))
+        .route("/api/jobs/import", post(import_jobs))
         .route(
             "/api/jobs/{name}",
             get(get_job).patch(update_job).delete(delete_job),
@@ -3614,6 +3855,34 @@ mod tests {
         assert_eq!(records[0].job, "alpha");
         assert_eq!(records[0].duration_ms, 42);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn validates_portable_jobs_for_import() {
+        let portable = PortableJob {
+            name: "imported".to_owned(),
+            description: "teste".to_owned(),
+            datetime: "* * * * *".to_owned(),
+            action: "exit 0".to_owned(),
+            status: "ativo".to_owned(),
+            working_dir: None,
+            timeout_seconds: Some(30),
+            retries: 2,
+            retry_delay_seconds: 5,
+            notify_url: Some("https://example.com/hook".to_owned()),
+        };
+        let job = portable_job_to_job(&portable).unwrap();
+        assert_eq!(job.name, "imported");
+        assert_eq!(job.version, 1);
+        assert_eq!(job.timeout_seconds, Some(30));
+        assert_eq!(job.retries, 2);
+
+        let mut invalid = portable;
+        invalid.name = "../escape".to_owned();
+        assert!(portable_job_to_job(&invalid).is_err());
+        invalid.name = "valid".to_owned();
+        invalid.action = "   ".to_owned();
+        assert!(portable_job_to_job(&invalid).is_err());
     }
 
     #[test]

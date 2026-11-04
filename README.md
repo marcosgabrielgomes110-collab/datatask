@@ -183,7 +183,7 @@ que podem ser desativadas nas preferências. A navegação lateral separa:
 - **Tarefas** — resumo (total, ativas, recorrentes, executadas hoje), busca,
   filtro por status, ordenação por coluna, paginação server-side, execução
   manual com indicador de “executando”, histórico do último resultado (sucesso,
-  falha ou timeout), duplicação e edição.
+  falha ou timeout), duplicação, edição, exportação e importação de jobs em JSON.
 - **Logs** — lista de tarefas, visualizador com acompanhamento ao vivo
   (polling incremental por offset), filtro de linhas, quebra de linha,
   rolagem automática, download e limpeza do log.
@@ -397,6 +397,11 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
   retorna `{items,total,limit,offset}` (`limit` padrão 50, máximo 500).
   `sort` aceita `name`, `schedule`, `status` ou `last`; `order` é `asc`/`desc`.
   A listagem usa cache em memória invalidado por mtime/tamanho dos arquivos
+- `GET /api/jobs/export` — baixa um documento JSON com `format`, `version`,
+  `exported_at` e `jobs` (campos configuráveis, sem histórico de execução)
+- `POST /api/jobs/import` — importa `{format,version,jobs,on_conflict,dry_run}`;
+  `on_conflict` aceita `skip` (padrão) ou `overwrite`, e `dry_run: true`
+  retorna a prévia sem gravar
 - `POST /api/jobs` — criar job; JSON: `name`, `description`, `datetime`,
   `action` e, opcionalmente, `status`, `working_dir`, `timeout_seconds`,
   `retries`, `retry_delay_seconds` e `notify_url`
@@ -451,6 +456,57 @@ curl -X PATCH http://127.0.0.1:8080/api/jobs/exemplo \
 Se outro cliente alterou o job antes, a resposta é `409` com o job atual no
 campo `current`; recarregue e refaça a edição. O painel usa esse fluxo
 automaticamente.
+
+## Exportar e importar jobs
+
+A exportação baixa os campos configuráveis de todos os jobs (sem histórico de
+execução):
+
+```bash
+curl -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
+  -o jobs.json http://127.0.0.1:8080/api/jobs/export
+```
+
+O arquivo tem o formato:
+
+```json
+{
+  "format": "datatask.jobs",
+  "version": 1,
+  "exported_at": "2026-11-04T10:00:00-03:00",
+  "jobs": [
+    {
+      "name": "backup",
+      "description": "Backup diário",
+      "datetime": "0 3 * * *",
+      "action": "tar -czf /backup/db.tgz /dados",
+      "status": "ativo",
+      "retries": 2,
+      "retry_delay_seconds": 5,
+      "notify_url": "https://exemplo.com/hook"
+    }
+  ]
+}
+```
+
+Prévia sem gravar (`dry_run`) e importação real:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/jobs/import \
+  -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"format":"datatask.jobs","version":1,"jobs":[...],"on_conflict":"skip","dry_run":true}'
+```
+
+`on_conflict`:
+
+- `skip` (padrão): jobs existentes ficam intactos e aparecem em `skipped`;
+- `overwrite`: configuração é substituída, preservando `last_run`/resultado e
+  incrementando `version`.
+
+A resposta contém `created`, `overwritten`, `skipped`, `total`, `mode` e
+`dry_run`. Jobs inválidos retornam `400` com a lista `errors` e nada é gravado.
+O painel usa prévia e oferece as opções **Sobrescrever** ou **Ignorar**.
 
 ## Histórico de execuções
 

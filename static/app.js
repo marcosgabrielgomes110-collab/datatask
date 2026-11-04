@@ -54,6 +54,9 @@
     jobsPage: $("#jobsPage"),
     jobsPrev: $("#jobsPrev"),
     jobsNext: $("#jobsNext"),
+    exportJobs: $("#exportJobs"),
+    importJobs: $("#importJobs"),
+    importFile: $("#importFile"),
     statTotal: $("#statTotal"),
     statActive: $("#statActive"),
     statRecurring: $("#statRecurring"),
@@ -394,6 +397,11 @@
       try {
         const body = await response.json();
         if (body.error) message = body.error;
+        if (Array.isArray(body.errors) && body.errors.length) {
+          const first = body.errors[0];
+          const subject = first.name || `item ${first.index}`;
+          message += ` (${subject}: ${first.error})`;
+        }
       } catch (_) { /* resposta sem JSON */ }
       if (response.status === 401) {
         setToken("");
@@ -1333,6 +1341,117 @@
   /* Ações de tarefa                                                        */
   /* ---------------------------------------------------------------------- */
 
+  async function exportJobs() {
+    const token = getToken();
+    if (!token) {
+      toast("Conecte-se à API para exportar.", "error");
+      return;
+    }
+    try {
+      const response = await fetch("/api/jobs/export", {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        if (response.status === 401) {
+          setToken("");
+          setConnection("offline", "Token inválido");
+        }
+        throw new Error(`Erro HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename="([^"]+)"/);
+      const filename = match ? match[1] : "datatask-jobs.json";
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast("Exportação gerada.", "success");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  async function importJobsFile(file) {
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      toast("O arquivo de importação deve ter no máximo 2 MiB.", "error");
+      return;
+    }
+    let imported;
+    try {
+      imported = JSON.parse(await file.text());
+    } catch (_) {
+      toast("O arquivo não é um JSON válido.", "error");
+      return;
+    }
+    if (!imported || !Array.isArray(imported.jobs)) {
+      toast("O arquivo não contém uma lista 'jobs'.", "error");
+      return;
+    }
+    try {
+      const preview = await api("/api/jobs/import", {
+        method: "POST",
+        body: JSON.stringify({ ...imported, dry_run: true, on_conflict: "skip" })
+      });
+      const created = preview.created?.length || 0;
+      const skipped = preview.skipped?.length || 0;
+      let mode = "skip";
+      if (skipped > 0) {
+        const overwrite = await confirmAction({
+          title: "Jobs existentes",
+          message: `${created} novo(s) e ${skipped} já existente(s). Sobrescrever os existentes?`,
+          acceptLabel: "Sobrescrever"
+        });
+        if (overwrite) {
+          mode = "overwrite";
+        } else {
+          const proceed = await confirmAction({
+            title: "Ignorar existentes",
+            message: `Importar somente ${created} job(s) novo(s)?`,
+            acceptLabel: "Importar",
+            danger: false
+          });
+          if (!proceed) return;
+          if (created === 0) {
+            toast("Nenhum job novo para importar.", "info");
+            return;
+          }
+        }
+      } else {
+        const proceed = await confirmAction({
+          title: "Importar jobs",
+          message: `Criar ${created} job(s)?`,
+          acceptLabel: "Importar",
+          danger: false
+        });
+        if (!proceed) return;
+      }
+
+      const result = await api("/api/jobs/import", {
+        method: "POST",
+        body: JSON.stringify({ ...imported, dry_run: false, on_conflict: mode })
+      });
+      el.importFile.value = "";
+      toast(
+        `Importação concluída: ${result.created?.length || 0} criado(s), ` +
+        `${result.overwritten?.length || 0} sobrescrito(s), ` +
+        `${result.skipped?.length || 0} ignorado(s).`,
+        "success"
+      );
+      await refreshData({ silent: true });
+      if (state.view === "logs" || state.view === "historico") {
+        await loadPickerJobs();
+      }
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
   function watchRunning() {
     clearInterval(state.timers.watch);
     state.timers.watch = null;
@@ -1736,6 +1855,14 @@
       } catch (error) {
         toast(error.message, "error");
       }
+    });
+
+    el.exportJobs.addEventListener("click", exportJobs);
+    el.importJobs.addEventListener("click", () => el.importFile.click());
+    el.importFile.addEventListener("change", () => {
+      const file = el.importFile.files?.[0];
+      el.importFile.value = "";
+      importJobsFile(file).catch(error => toast(error.message, "error"));
     });
 
     el.searchInput.addEventListener("input", () => {

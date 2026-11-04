@@ -52,5 +52,8 @@ advisory com crédito, se desejado.
 - `notify_url` permite que quem possui o token faça o servidor enviar POSTs
   para destinos arbitrários (potencial SSRF). Redirecionamentos não são
   seguidos; mantenha o token restrito e use apenas destinos confiáveis.
+- A exportação inclui `action` e `notify_url` dos jobs, que podem conter
+  segredos. Trate o JSON exportado como credencial (`600`) e não o publique.
+  A importação pode sobrescrever jobs existentes; revise a prévia antes.
 - Se você encontrar token em log, histórico de shell, issue ou commit, rotacione
   imediatamente e remova o segredo do histórico.
