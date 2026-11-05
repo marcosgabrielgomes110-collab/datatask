@@ -41,6 +41,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   restauração guiada no painel com bloqueio de arquivos corrompidos.
 - Envio opcional de backups para SSH (`scp`/`ssh`) ou S3 (`aws s3 cp`), com
   criptografia GPG simétrica opcional e verificação SHA-256 remota.
+- Retenção remota: após cada upload, artefatos antigos e sidecars além de
+  `backup_retention` são removidos do destino, com auditoria de falhas.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

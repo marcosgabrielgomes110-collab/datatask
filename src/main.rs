@@ -190,6 +190,7 @@ struct AppState {
     /// commands that outlive the grace period.
     process_groups: Arc<StdMutex<HashSet<u32>>>,
     job_slots: Arc<Semaphore>,
+    backup_lock: Arc<Mutex<()>>,
     token_digest: [u8; 32],
     guard: Arc<AccessGuard>,
     audit: Option<Arc<AuditLog>>,
@@ -956,6 +957,16 @@ async fn upload_file(
     );
     match target {
         RemoteTarget::Ssh { host, dir, port } => {
+            let mut mkdir = Command::new("ssh");
+            if *port != 22 {
+                mkdir.arg("-p").arg(port.to_string());
+            }
+            mkdir
+                .arg(host)
+                .arg(format!("mkdir -p {}", shell_quote(dir)));
+            let output = run_command(&mut mkdir, timeout).await?;
+            ensure_command_success("ssh mkdir", &output)?;
+
             let mut command = Command::new("scp");
             command.arg("-q");
             if *port != 22 {
@@ -1071,7 +1082,113 @@ async fn upload_backup(
     result
 }
 
-async fn run_backup(state: &AppState) {
+fn is_remote_artifact(name: &str) -> bool {
+    name.starts_with("datatask-jobs-") && (name.ends_with(".json") || name.ends_with(".json.enc"))
+}
+
+fn remote_artifacts_to_prune(mut names: Vec<String>, retention: u32) -> Vec<String> {
+    if retention == 0 {
+        return Vec::new();
+    }
+    names.retain(|name| is_remote_artifact(name));
+    names.sort();
+    let remove = names.len().saturating_sub(retention as usize);
+    names.into_iter().take(remove).collect()
+}
+
+async fn list_remote_artifacts(
+    target: &RemoteTarget,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    match target {
+        RemoteTarget::Ssh { host, dir, port } => {
+            let mut command = Command::new("ssh");
+            if *port != 22 {
+                command.arg("-p").arg(port.to_string());
+            }
+            command.arg(host).arg(format!("ls -1 {}", shell_quote(dir)));
+            let output = run_command(&mut command, timeout).await?;
+            ensure_command_success("ssh list backups", &output)?;
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|name| is_remote_artifact(name))
+                .map(str::to_owned)
+                .collect())
+        }
+        RemoteTarget::S3 { base } => {
+            let mut command = Command::new("aws");
+            command.arg("s3").arg("ls").arg(format!("{base}/"));
+            let output = run_command(&mut command, timeout).await?;
+            ensure_command_success("aws s3 list backups", &output)?;
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_whitespace().last())
+                .filter(|name| is_remote_artifact(name))
+                .map(str::to_owned)
+                .collect())
+        }
+    }
+}
+
+async fn delete_remote_artifacts(
+    target: &RemoteTarget,
+    names: &[String],
+    timeout: Duration,
+) -> Result<(), String> {
+    match target {
+        RemoteTarget::Ssh { host, dir, port } => {
+            let mut script = format!("cd {} && rm -f --", shell_quote(dir));
+            for name in names {
+                script.push(' ');
+                script.push_str(&shell_quote(name));
+                script.push(' ');
+                script.push_str(&shell_quote(&format!("{name}.sha256")));
+            }
+            let mut command = Command::new("ssh");
+            if *port != 22 {
+                command.arg("-p").arg(port.to_string());
+            }
+            command.arg(host).arg(script);
+            let output = run_command(&mut command, timeout).await?;
+            ensure_command_success("ssh prune backups", &output)
+        }
+        RemoteTarget::S3 { base } => {
+            for name in names {
+                for key in [name.clone(), format!("{name}.sha256")] {
+                    let mut command = Command::new("aws");
+                    command
+                        .arg("s3")
+                        .arg("rm")
+                        .arg(format!("{base}/{key}"))
+                        .arg("--only-show-errors");
+                    let output = run_command(&mut command, timeout).await?;
+                    ensure_command_success("aws s3 prune backup", &output)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn prune_remote_backups(
+    target: &RemoteTarget,
+    retention: u32,
+    timeout: Duration,
+) -> Result<usize, String> {
+    if retention == 0 {
+        return Ok(0);
+    }
+    let names = list_remote_artifacts(target, timeout).await?;
+    let remove = remote_artifacts_to_prune(names, retention);
+    if remove.is_empty() {
+        return Ok(0);
+    }
+    delete_remote_artifacts(target, &remove, timeout).await?;
+    Ok(remove.len())
+}
+
+async fn run_backup(state: Arc<AppState>) {
     let Some(dir) = &state.config.backup_dir else {
         return;
     };
@@ -1092,24 +1209,53 @@ async fn run_backup(state: &AppState) {
                 "sha256": checksum,
             }));
             match remote_target(&state.config) {
-                Ok(Some(target)) => match upload_backup(state, &path, &checksum).await {
-                    Ok((file, remote_checksum)) => state.audit(json!({
-                        "ts": Local::now().to_rfc3339(),
-                        "event": "backup.uploaded",
-                        "remote": target.label(),
-                        "file": file,
-                        "sha256": remote_checksum,
-                    })),
-                    Err(error) => {
-                        eprintln!("Remote backup upload failed: {error}");
-                        state.audit(json!({
-                            "ts": Local::now().to_rfc3339(),
-                            "event": "backup.upload_error",
-                            "remote": target.label(),
-                            "error": error,
-                        }));
+                Ok(Some(target)) => {
+                    let timeout = Duration::from_secs(state.config.backup_remote_timeout_seconds);
+                    match upload_backup(&state, &path, &checksum).await {
+                        Ok((file, remote_checksum)) => {
+                            state.audit(json!({
+                                "ts": Local::now().to_rfc3339(),
+                                "event": "backup.uploaded",
+                                "remote": target.label(),
+                                "file": file,
+                                "sha256": remote_checksum,
+                            }));
+                            match prune_remote_backups(
+                                &target,
+                                state.config.backup_retention,
+                                timeout,
+                            )
+                            .await
+                            {
+                                Ok(0) => {}
+                                Ok(deleted) => state.audit(json!({
+                                    "ts": Local::now().to_rfc3339(),
+                                    "event": "backup.pruned",
+                                    "remote": target.label(),
+                                    "deleted": deleted,
+                                })),
+                                Err(error) => {
+                                    eprintln!("Remote backup prune failed: {error}");
+                                    state.audit(json!({
+                                        "ts": Local::now().to_rfc3339(),
+                                        "event": "backup.prune_error",
+                                        "remote": target.label(),
+                                        "error": error,
+                                    }));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Remote backup upload failed: {error}");
+                            state.audit(json!({
+                                "ts": Local::now().to_rfc3339(),
+                                "event": "backup.upload_error",
+                                "remote": target.label(),
+                                "error": error,
+                            }));
+                        }
                     }
-                },
+                }
                 Ok(None) => {}
                 Err(error) => eprintln!("Cannot configure remote backup: {error}"),
             }
@@ -3951,7 +4097,13 @@ async fn scheduler(state: Arc<AppState>) {
             });
             if due {
                 last_backup = Some(Instant::now());
-                run_backup(&state).await;
+                let backup_state = state.clone();
+                tokio::spawn(async move {
+                    let lock = backup_state.backup_lock.clone();
+                    if let Ok(_guard) = lock.try_lock() {
+                        run_backup(backup_state).await;
+                    }
+                });
             }
         }
     }
@@ -4151,6 +4303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         running_jobs: Arc::new(StdMutex::new(HashSet::new())),
         process_groups: Arc::new(StdMutex::new(HashSet::new())),
         job_slots: Arc::new(Semaphore::new(config.max_concurrent_jobs)),
+        backup_lock: Arc::new(Mutex::new(())),
         token_digest: digest,
         guard,
         audit,
@@ -4539,6 +4692,22 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn selects_old_remote_artifacts_for_pruning() {
+        let names = vec![
+            "datatask-jobs-20260101-000000.json".to_owned(),
+            "datatask-jobs-20260101-000000.json.sha256".to_owned(),
+            "datatask-jobs-20260102-000000.json.enc".to_owned(),
+            "datatask-jobs-20260102-000000.json.enc.sha256".to_owned(),
+            "datatask-jobs-20260103-000000.json".to_owned(),
+            "unrelated.txt".to_owned(),
+        ];
+        assert_eq!(
+            remote_artifacts_to_prune(names, 2),
+            vec!["datatask-jobs-20260101-000000.json".to_owned()]
         );
     }
 

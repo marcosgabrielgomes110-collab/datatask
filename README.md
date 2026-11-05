@@ -562,9 +562,10 @@ backup_ssh_port = 22
 O envio usa `scp`/`ssh` ou `aws s3 cp`, e depois **baixa o artefato remoto e
 compara o SHA-256** com o local. O sidecar `.sha256` também é enviado. Falhas de
 upload são auditadas (`backup.upload_error`) e não removem o backup local;
-`backup_remote_timeout_seconds` limita cada comando. A retenção
-`backup_retention` é local: configure lifecycle no bucket S3 ou limpeza no
-destino SSH separadamente.
+`backup_remote_timeout_seconds` limita cada comando. Após cada upload, a mesma
+`backup_retention` remove os artefatos mais antigos (e seus sidecars) no
+destino; falhas de limpeza são auditadas (`backup.prune_error`) sem apagar o
+backup local.
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:
