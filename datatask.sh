@@ -400,6 +400,7 @@ backup_ssh_port = 22
 backup_s3_uri = ""
 backup_encryption_key_file = ""
 backup_remote_timeout_seconds = 60
+backup_verify_interval_seconds = 86400
 EOF
   umask "$old_umask"
 }
@@ -593,6 +594,7 @@ cmd_setup() {
   local prev_backup_ssh prev_backup_ssh_set=0 prev_backup_port prev_backup_port_set=0
   local prev_backup_s3 prev_backup_s3_set=0 prev_backup_key prev_backup_key_set=0
   local prev_backup_timeout prev_backup_timeout_set=0
+  local prev_backup_verify prev_backup_verify_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -661,6 +663,10 @@ cmd_setup() {
   if grep -qE '^[[:space:]]*backup_remote_timeout_seconds[[:space:]]*=' "$conf"; then
     prev_backup_timeout="$(config_get "$conf" backup_remote_timeout_seconds)"
     prev_backup_timeout_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_verify_interval_seconds[[:space:]]*=' "$conf"; then
+    prev_backup_verify="$(config_get "$conf" backup_verify_interval_seconds)"
+    prev_backup_verify_set=1
   fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
@@ -737,6 +743,7 @@ cmd_setup() {
   [[ "$prev_backup_s3_set" -eq 1 ]] && config_set_string "$conf" backup_s3_uri "$prev_backup_s3"
   [[ "$prev_backup_key_set" -eq 1 ]] && config_set_string "$conf" backup_encryption_key_file "$prev_backup_key"
   [[ "$prev_backup_timeout_set" -eq 1 ]] && config_set_raw "$conf" backup_remote_timeout_seconds "$prev_backup_timeout"
+  [[ "$prev_backup_verify_set" -eq 1 ]] && config_set_raw "$conf" backup_verify_interval_seconds "$prev_backup_verify"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then

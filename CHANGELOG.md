@@ -43,6 +43,9 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   criptografia GPG simétrica opcional e verificação SHA-256 remota.
 - Retenção remota: após cada upload, artefatos antigos e sidecars além de
   `backup_retention` são removidos do destino, com auditoria de falhas.
+- Verificação periódica de integridade dos backups remotos
+  (`backup_verify_interval_seconds`) e endpoint manual
+  `POST /api/backups/verify`.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

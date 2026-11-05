@@ -115,6 +115,9 @@ struct Config {
     backup_encryption_key_file: Option<PathBuf>,
     #[serde(default = "default_backup_remote_timeout_seconds")]
     backup_remote_timeout_seconds: u64,
+    /// Periodic remote checksum verification. `0` disables the periodic check.
+    #[serde(default = "default_backup_verify_interval_seconds")]
+    backup_verify_interval_seconds: u64,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -165,6 +168,10 @@ fn default_backup_remote_timeout_seconds() -> u64 {
     60
 }
 
+fn default_backup_verify_interval_seconds() -> u64 {
+    86_400
+}
+
 fn default_job_version() -> u64 {
     1
 }
@@ -196,6 +203,7 @@ struct AppState {
     audit: Option<Arc<AuditLog>>,
     history: Option<Arc<HistoryLog>>,
     last_tick: Arc<StdMutex<Option<Instant>>>,
+    last_backup_verify: Arc<StdMutex<Option<BackupVerifySummary>>>,
     metrics: Arc<Metrics>,
     http_client: reqwest::Client,
 }
@@ -1188,6 +1196,136 @@ async fn prune_remote_backups(
     Ok(remove.len())
 }
 
+async fn read_remote_file(
+    target: &RemoteTarget,
+    name: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    match target {
+        RemoteTarget::Ssh { host, dir, port } => {
+            let path = format!("{}/{}", dir.trim_end_matches('/'), name);
+            let mut command = Command::new("ssh");
+            if *port != 22 {
+                command.arg("-p").arg(port.to_string());
+            }
+            command.arg(host).arg(format!("cat {}", shell_quote(&path)));
+            let output = run_command(&mut command, timeout).await?;
+            ensure_command_success("ssh read backup", &output)?;
+            Ok(output.stdout)
+        }
+        RemoteTarget::S3 { base } => {
+            let mut command = Command::new("aws");
+            command
+                .arg("s3")
+                .arg("cp")
+                .arg(format!("{base}/{name}"))
+                .arg("-")
+                .arg("--only-show-errors");
+            let output = run_command(&mut command, timeout).await?;
+            ensure_command_success("aws s3 read backup", &output)?;
+            Ok(output.stdout)
+        }
+    }
+}
+
+async fn verify_remote_backups(
+    target: &RemoteTarget,
+    timeout: Duration,
+) -> Result<BackupVerifySummary, String> {
+    let names = list_remote_artifacts(target, timeout).await?;
+    let mut items = Vec::with_capacity(names.len());
+    for name in names {
+        let sidecar_name = format!("{name}.sha256");
+        let result = async {
+            let sidecar = read_remote_file(target, &sidecar_name, timeout).await?;
+            let expected = String::from_utf8_lossy(&sidecar)
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| "empty checksum sidecar".to_owned())?
+                .to_owned();
+            let data = read_remote_file(target, &name, timeout).await?;
+            let actual = sha256_hex(&data);
+            if !expected.eq_ignore_ascii_case(&actual) {
+                return Err("checksum mismatch".to_owned());
+            }
+            Ok(())
+        }
+        .await;
+        items.push(BackupVerifyItem {
+            name,
+            ok: result.is_ok(),
+            error: result.err(),
+        });
+    }
+    let ok = items.iter().filter(|item| item.ok).count();
+    Ok(BackupVerifySummary {
+        timestamp: Local::now().to_rfc3339(),
+        checked: items.len(),
+        ok,
+        failed: items.len() - ok,
+        items,
+    })
+}
+
+fn record_backup_verify(state: &AppState, target: &RemoteTarget, summary: &BackupVerifySummary) {
+    *state
+        .last_backup_verify
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary.clone());
+    state.audit(json!({
+        "ts": Local::now().to_rfc3339(),
+        "event": "backup.verify",
+        "remote": target.label(),
+        "checked": summary.checked,
+        "ok": summary.ok,
+        "failed": summary.failed,
+    }));
+    if summary.failed > 0 {
+        state.audit(json!({
+            "ts": Local::now().to_rfc3339(),
+            "event": "backup.verify_error",
+            "remote": target.label(),
+            "items": summary.items,
+        }));
+    }
+}
+
+async fn run_remote_verify(state: Arc<AppState>) {
+    let target = match remote_target(&state.config) {
+        Ok(Some(target)) => target,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("Cannot configure remote backup verification: {error}");
+            return;
+        }
+    };
+    let timeout = Duration::from_secs(state.config.backup_remote_timeout_seconds);
+    match verify_remote_backups(&target, timeout).await {
+        Ok(summary) => record_backup_verify(&state, &target, &summary),
+        Err(error) => {
+            eprintln!("Remote backup verification failed: {error}");
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.verify_error",
+                "remote": target.label(),
+                "error": error,
+            }));
+        }
+    }
+}
+
+async fn verify_backups(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let target = remote_target(&state.config)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Remote backup is not configured."))?;
+    let timeout = Duration::from_secs(state.config.backup_remote_timeout_seconds);
+    let summary = verify_remote_backups(&target, timeout)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    record_backup_verify(&state, &target, &summary);
+    Ok(Json(json!(summary)))
+}
+
 async fn run_backup(state: Arc<AppState>) {
     let Some(dir) = &state.config.backup_dir else {
         return;
@@ -1280,6 +1418,22 @@ struct BackupInfo {
     checksum_ok: bool,
     valid_json: bool,
     jobs: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct BackupVerifyItem {
+    name: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct BackupVerifySummary {
+    timestamp: String,
+    checked: usize,
+    ok: usize,
+    failed: usize,
+    items: Vec<BackupVerifyItem>,
 }
 
 fn checksum_path(path: &FsPath) -> PathBuf {
@@ -3950,6 +4104,11 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
                 .is_some_and(|last_run| last_run.starts_with(&today))
         })
         .count();
+    let last_backup_verify = state
+        .last_backup_verify
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     Ok(Json(json!({
         "name": "DataTask",
         "version": env!("CARGO_PKG_VERSION"),
@@ -3992,6 +4151,8 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
             ""
         },
         "backup_encryption": state.config.backup_encryption_key_file.is_some(),
+        "backup_verify_interval_seconds": state.config.backup_verify_interval_seconds,
+        "backup_last_verify": last_backup_verify,
         "active_count": active_count,
         "recurring_count": recurring_count,
         "executed_today_count": executed_today_count,
@@ -4027,6 +4188,7 @@ async fn scheduler(state: Arc<AppState>) {
     let interval = Duration::from_secs(state.config.poll_interval_seconds);
     let mut ticker = time::interval(interval);
     let mut last_backup: Option<Instant> = None;
+    let mut last_verify: Option<Instant> = None;
     loop {
         ticker.tick().await;
         *state
@@ -4102,6 +4264,23 @@ async fn scheduler(state: Arc<AppState>) {
                     let lock = backup_state.backup_lock.clone();
                     if let Ok(_guard) = lock.try_lock() {
                         run_backup(backup_state).await;
+                    }
+                });
+            }
+        }
+        let remote_configured =
+            state.config.backup_ssh_target.is_some() || state.config.backup_s3_uri.is_some();
+        if remote_configured && state.config.backup_verify_interval_seconds > 0 {
+            let due = last_verify.is_none_or(|last| {
+                last.elapsed() >= Duration::from_secs(state.config.backup_verify_interval_seconds)
+            });
+            if due {
+                last_verify = Some(Instant::now());
+                let verify_state = state.clone();
+                tokio::spawn(async move {
+                    let lock = verify_state.backup_lock.clone();
+                    if let Ok(_guard) = lock.try_lock() {
+                        run_remote_verify(verify_state).await;
                     }
                 });
             }
@@ -4309,6 +4488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit,
         history,
         last_tick: Arc::new(StdMutex::new(None)),
+        last_backup_verify: Arc::new(StdMutex::new(None)),
         metrics: Arc::new(Metrics::new()),
         http_client,
     });
@@ -4318,6 +4498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/info", get(get_info))
         .route("/api/history", get(get_history))
         .route("/api/backups", get(get_backups))
+        .route("/api/backups/verify", post(verify_backups))
         .route("/api/backups/{name}", get(get_backup_file))
         .route("/api/jobs", get(get_jobs).post(create_job))
         .route("/api/jobs/export", get(export_jobs))

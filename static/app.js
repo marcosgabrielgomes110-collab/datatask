@@ -96,6 +96,7 @@
     infoRefresh: $("#infoRefresh"),
     serverInfo: $("#serverInfo"),
     backupsRefresh: $("#backupsRefresh"),
+    backupsVerify: $("#backupsVerify"),
     backupsSummary: $("#backupsSummary"),
     backupsBody: $("#backupsBody"),
     jobDialog: $("#jobDialog"),
@@ -722,6 +723,9 @@
       ["Backup", info.backup_enabled ? `${info.backup_dir} · a cada ${info.backup_interval_seconds}s · ${info.backup_retention} cópias` : "desativado"],
       ["Backup remoto", info.backup_remote || "desativado"],
       ["Backup criptografado", info.backup_encryption ? "sim" : "não"],
+      ["Última verificação", info.backup_last_verify
+        ? `${info.backup_last_verify.ok}/${info.backup_last_verify.checked} OK · ${formatHistoryTime(info.backup_last_verify.timestamp)}`
+        : "nunca"],
       ["Tarefas cadastradas", String(info.job_count)],
       ["Tarefas ativas", String(info.active_count)],
       ["Executando agora", running ? `${running} (${info.running.join(", ")})` : "nenhuma"],
@@ -1952,6 +1956,24 @@
     });
     el.backupsRefresh.addEventListener("click", () => {
       loadBackups().catch(error => toast(error.message, "error"));
+    });
+    el.backupsVerify.addEventListener("click", async () => {
+      if (!getToken()) {
+        toast("Conecte-se à API para verificar.", "error");
+        return;
+      }
+      try {
+        const result = await api("/api/backups/verify", { method: "POST" });
+        toast(
+          `Verificação remota: ${result.ok}/${result.checked} OK` +
+          (result.failed ? `, ${result.failed} falha(s).` : "."),
+          result.failed ? "error" : "success"
+        );
+        await refreshData({ silent: true });
+        await loadBackups();
+      } catch (error) {
+        toast(error.message, "error");
+      }
     });
     el.backupsBody.addEventListener("click", event => {
       const button = event.target.closest("button[data-backup]");

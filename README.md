@@ -45,6 +45,7 @@ backup_retention = 7
 # backup_s3_uri = "s3://bucket/datatask/"
 # backup_encryption_key_file = "/etc/datatask/backup.key"
 backup_remote_timeout_seconds = 60
+backup_verify_interval_seconds = 86400
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -86,6 +87,8 @@ exportação JSON; `""` desativa. `backup_interval_seconds` define o intervalo
 No `install`, caminhos relativos de backup são ancorados em `/var/lib/datatask`.
 `backup_ssh_target` ou `backup_s3_uri` enviam uma cópia externa; com
 `backup_encryption_key_file`, o artefato remoto é cifrado com GPG.
+`backup_verify_interval_seconds` faz a verificação periódica dos checksums no
+destino (`0` desativa).
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -411,6 +414,7 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
   padrão 50 (máx. 200)
 - `GET /api/backups` — lista backups automáticos com tamanho, data, contagem de
   jobs e status do checksum SHA-256
+- `POST /api/backups/verify` — baixa e verifica os checksums no destino remoto
 - `GET /api/backups/{name}` — baixa um backup somente se o checksum conferir
   (`409` se ausente/divergente)
 - `GET /api/jobs` — lista completa (array); com `?limit=&offset=&q=&status=&sort=&order=`
@@ -566,6 +570,16 @@ upload são auditadas (`backup.upload_error`) e não removem o backup local;
 `backup_retention` remove os artefatos mais antigos (e seus sidecars) no
 destino; falhas de limpeza são auditadas (`backup.prune_error`) sem apagar o
 backup local.
+
+Com `backup_verify_interval_seconds > 0`, o scheduler baixa cada artefato
+remoto e seu sidecar, recalcula o SHA-256 e audita `backup.verify` /
+`backup.verify_error`. A tela de backups e o endpoint manual também permitem
+disparar a checagem:
+
+```bash
+curl -X POST -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
+  http://127.0.0.1:8080/api/backups/verify
+```
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:
