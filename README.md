@@ -40,6 +40,11 @@ history_file = "logs/history.jsonl"
 backup_dir = "backups"
 backup_interval_seconds = 86400
 backup_retention = 7
+# backup_ssh_target = "user@host:/srv/datatask-backups"
+# backup_ssh_port = 22
+# backup_s3_uri = "s3://bucket/datatask/"
+# backup_encryption_key_file = "/etc/datatask/backup.key"
+backup_remote_timeout_seconds = 60
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -79,6 +84,8 @@ continuam funcionando com histórico vazio.
 exportação JSON; `""` desativa. `backup_interval_seconds` define o intervalo
 (padrão 24 h) e `backup_retention` quantos arquivos manter (`0` mantém todos).
 No `install`, caminhos relativos de backup são ancorados em `/var/lib/datatask`.
+`backup_ssh_target` ou `backup_s3_uri` enviam uma cópia externa; com
+`backup_encryption_key_file`, o artefato remoto é cifrado com GPG.
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -537,7 +544,50 @@ cada `backup_interval_seconds`. Cada arquivo:
 O backup não inclui logs nem histórico de execuções. A tela **Configurações →
 Backups** lista os arquivos, mostra o status do checksum e permite restaurar
 com prévia do que será criado/sobrescrito; backups com checksum ausente ou
-divergente ficam bloqueados. A restauração também pode ser feita pela API:
+divergente ficam bloqueados.
+
+### Envio externo (SSH/S3)
+
+Além do diretório local, é possível enviar cada backup para **um** destino:
+
+```toml
+# SSH (requer scp/ssh e chave/agent configurados para o usuário do serviço)
+backup_ssh_target = "user@host:/srv/datatask-backups"
+backup_ssh_port = 22
+
+# ou S3 (requer AWS CLI e credenciais no ambiente do serviço)
+# backup_s3_uri = "s3://meu-bucket/datatask/"
+```
+
+O envio usa `scp`/`ssh` ou `aws s3 cp`, e depois **baixa o artefato remoto e
+compara o SHA-256** com o local. O sidecar `.sha256` também é enviado. Falhas de
+upload são auditadas (`backup.upload_error`) e não removem o backup local;
+`backup_remote_timeout_seconds` limita cada comando. A retenção
+`backup_retention` é local: configure lifecycle no bucket S3 ou limpeza no
+destino SSH separadamente.
+
+Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
+forte em arquivo `600` e configure:
+
+```bash
+openssl rand -base64 32 | sudo tee /etc/datatask/backup.key >/dev/null
+sudo chmod 600 /etc/datatask/backup.key
+```
+
+```toml
+backup_encryption_key_file = "/etc/datatask/backup.key"
+```
+
+O envio usa GPG simétrico AES-256 e envia `<arquivo>.enc` + checksum do
+cifrado. Para restaurar, decifre antes de importar:
+
+```bash
+gpg --batch --pinentry-mode loopback \
+  --passphrase-file /etc/datatask/backup.key \
+  --decrypt datatask-jobs-AAAAMMDD-HHMMSS.json.enc > jobs.json
+```
+
+A restauração também pode ser feita pela API:
 
 ```bash
 ls -l backups/

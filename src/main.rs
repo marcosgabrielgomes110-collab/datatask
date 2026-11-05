@@ -103,6 +103,18 @@ struct Config {
     backup_interval_seconds: u64,
     #[serde(default = "default_backup_retention")]
     backup_retention: u32,
+    /// Optional offsite copy destination: SSH target (`user@host:/dir`) or S3 URI.
+    #[serde(default)]
+    backup_ssh_target: Option<String>,
+    #[serde(default = "default_ssh_port")]
+    backup_ssh_port: u16,
+    #[serde(default)]
+    backup_s3_uri: Option<String>,
+    /// GPG passphrase file used to encrypt the uploaded artifact (600).
+    #[serde(default)]
+    backup_encryption_key_file: Option<PathBuf>,
+    #[serde(default = "default_backup_remote_timeout_seconds")]
+    backup_remote_timeout_seconds: u64,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -143,6 +155,14 @@ fn default_backup_interval_seconds() -> u64 {
 
 fn default_backup_retention() -> u32 {
     7
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+fn default_backup_remote_timeout_seconds() -> u64 {
+    60
 }
 
 fn default_job_version() -> u64 {
@@ -832,7 +852,226 @@ fn prune_backups(dir: &FsPath, retention: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn run_backup(state: &AppState) {
+enum RemoteTarget {
+    Ssh {
+        host: String,
+        dir: String,
+        port: u16,
+    },
+    S3 {
+        base: String,
+    },
+}
+
+impl RemoteTarget {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ssh { .. } => "ssh",
+            Self::S3 { .. } => "s3",
+        }
+    }
+}
+
+fn split_ssh_target(target: &str) -> Option<(&str, &str)> {
+    let (host, dir) = target.rsplit_once(':')?;
+    let host = host.trim();
+    let dir = dir.trim().trim_end_matches('/');
+    (!host.is_empty() && !dir.is_empty()).then_some((host, dir))
+}
+
+fn remote_target(config: &Config) -> Result<Option<RemoteTarget>, String> {
+    if let Some(target) = config.backup_ssh_target.as_deref() {
+        let (host, dir) =
+            split_ssh_target(target).ok_or_else(|| "Invalid backup_ssh_target.".to_owned())?;
+        return Ok(Some(RemoteTarget::Ssh {
+            host: host.to_owned(),
+            dir: dir.to_owned(),
+            port: config.backup_ssh_port,
+        }));
+    }
+    if let Some(uri) = config.backup_s3_uri.as_deref() {
+        return Ok(Some(RemoteTarget::S3 {
+            base: uri.trim_end_matches('/').to_owned(),
+        }));
+    }
+    Ok(None)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn run_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command.kill_on_drop(true);
+    match time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(format!("Cannot run command: {error}")),
+        Err(_) => Err("Remote backup command timed out.".to_owned()),
+    }
+}
+
+fn ensure_command_success(label: &str, output: &std::process::Output) -> Result<(), String> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("{label} failed: {}", stderr.trim()))
+}
+
+async fn encrypt_backup(
+    key: &FsPath,
+    input: &FsPath,
+    output: &FsPath,
+    timeout: Duration,
+) -> Result<(), String> {
+    let mut command = Command::new("gpg");
+    command
+        .arg("--batch")
+        .arg("--yes")
+        .arg("--pinentry-mode")
+        .arg("loopback")
+        .arg("--passphrase-file")
+        .arg(key)
+        .arg("--symmetric")
+        .arg("--cipher-algo")
+        .arg("AES256")
+        .arg("--output")
+        .arg(output)
+        .arg(input);
+    let result = run_command(&mut command, timeout).await?;
+    ensure_command_success("gpg encryption", &result)
+}
+
+async fn upload_file(
+    target: &RemoteTarget,
+    local: &FsPath,
+    remote_name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let expected = sha256_hex(
+        &fs::read(local).map_err(|error| format!("Cannot read upload artifact: {error}"))?,
+    );
+    match target {
+        RemoteTarget::Ssh { host, dir, port } => {
+            let mut command = Command::new("scp");
+            command.arg("-q");
+            if *port != 22 {
+                command.arg("-P").arg(port.to_string());
+            }
+            command
+                .arg(local)
+                .arg(format!("{host}:{}/", dir.trim_end_matches('/')));
+            let output = run_command(&mut command, timeout).await?;
+            ensure_command_success("scp upload", &output)?;
+
+            let remote_path = format!("{}/{}", dir.trim_end_matches('/'), remote_name);
+            let mut verify = Command::new("ssh");
+            if *port != 22 {
+                verify.arg("-p").arg(port.to_string());
+            }
+            verify
+                .arg(host)
+                .arg(format!("cat {}", shell_quote(&remote_path)));
+            let output = run_command(&mut verify, timeout).await?;
+            ensure_command_success("ssh verification", &output)?;
+            if sha256_hex(&output.stdout) != expected {
+                return Err("Remote checksum verification failed (ssh).".to_owned());
+            }
+        }
+        RemoteTarget::S3 { base } => {
+            let uri = format!("{}/{}", base, remote_name);
+            let mut command = Command::new("aws");
+            command
+                .arg("s3")
+                .arg("cp")
+                .arg(local)
+                .arg(&uri)
+                .arg("--only-show-errors");
+            let output = run_command(&mut command, timeout).await?;
+            ensure_command_success("aws s3 upload", &output)?;
+
+            let mut verify = Command::new("aws");
+            verify
+                .arg("s3")
+                .arg("cp")
+                .arg(&uri)
+                .arg("-")
+                .arg("--only-show-errors");
+            let output = run_command(&mut verify, timeout).await?;
+            ensure_command_success("aws s3 verification", &output)?;
+            if sha256_hex(&output.stdout) != expected {
+                return Err("Remote checksum verification failed (s3).".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn upload_backup(
+    state: &AppState,
+    json_path: &FsPath,
+    checksum: &str,
+) -> Result<(String, String), String> {
+    let target = remote_target(&state.config)?
+        .ok_or_else(|| "Remote backup target is not configured.".to_owned())?;
+    let timeout = Duration::from_secs(state.config.backup_remote_timeout_seconds);
+    let json_name = json_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Invalid backup filename.".to_owned())?;
+    let temp_dir = std::env::temp_dir().join(format!(
+        "datatask-upload-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let result = async {
+        if let Some(key) = &state.config.backup_encryption_key_file {
+            fs::create_dir_all(&temp_dir)
+                .map_err(|error| format!("Cannot create upload temp dir: {error}"))?;
+            let encrypted_name = format!("{json_name}.enc");
+            let encrypted_path = temp_dir.join(&encrypted_name);
+            encrypt_backup(key, json_path, &encrypted_path, timeout).await?;
+            let encrypted = fs::read(&encrypted_path)
+                .map_err(|error| format!("Cannot read encrypted backup: {error}"))?;
+            let encrypted_checksum = sha256_hex(&encrypted);
+            let sidecar = temp_dir.join(format!("{encrypted_name}.sha256"));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&sidecar)
+                .map_err(|error| format!("Cannot write upload checksum: {error}"))?;
+            file.write_all(format!("{encrypted_checksum}  {encrypted_name}\n").as_bytes())
+                .map_err(|error| format!("Cannot write upload checksum: {error}"))?;
+            upload_file(&target, &encrypted_path, &encrypted_name, timeout).await?;
+            upload_file(
+                &target,
+                &sidecar,
+                &format!("{encrypted_name}.sha256"),
+                timeout,
+            )
+            .await?;
+            Ok((encrypted_name, encrypted_checksum))
+        } else {
+            let sidecar = checksum_path(json_path);
+            upload_file(&target, json_path, json_name, timeout).await?;
+            upload_file(&target, &sidecar, &format!("{json_name}.sha256"), timeout).await?;
+            Ok((json_name.to_owned(), checksum.to_owned()))
+        }
+    }
+    .await;
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+async fn run_backup(state: &AppState) {
     let Some(dir) = &state.config.backup_dir else {
         return;
     };
@@ -844,13 +1083,37 @@ fn run_backup(state: &AppState) {
         }
     };
     match write_backup(dir, state.config.backup_retention, &jobs) {
-        Ok((path, checksum)) => state.audit(json!({
-            "ts": Local::now().to_rfc3339(),
-            "event": "backup.created",
-            "path": path.display().to_string(),
-            "jobs": jobs.len(),
-            "sha256": checksum,
-        })),
+        Ok((path, checksum)) => {
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.created",
+                "path": path.display().to_string(),
+                "jobs": jobs.len(),
+                "sha256": checksum,
+            }));
+            match remote_target(&state.config) {
+                Ok(Some(target)) => match upload_backup(state, &path, &checksum).await {
+                    Ok((file, remote_checksum)) => state.audit(json!({
+                        "ts": Local::now().to_rfc3339(),
+                        "event": "backup.uploaded",
+                        "remote": target.label(),
+                        "file": file,
+                        "sha256": remote_checksum,
+                    })),
+                    Err(error) => {
+                        eprintln!("Remote backup upload failed: {error}");
+                        state.audit(json!({
+                            "ts": Local::now().to_rfc3339(),
+                            "event": "backup.upload_error",
+                            "remote": target.label(),
+                            "error": error,
+                        }));
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => eprintln!("Cannot configure remote backup: {error}"),
+            }
+        }
         Err(error) => {
             eprintln!("Backup failed: {error}");
             state.audit(json!({
@@ -1632,6 +1895,20 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         Some(path) if path.is_relative() => Some(base.join(path)),
         Some(path) => Some(path),
     };
+    config.backup_encryption_key_file = match config.backup_encryption_key_file.take() {
+        None => None,
+        Some(path) if path.as_os_str().is_empty() => None,
+        Some(path) if path.is_relative() => Some(base.join(path)),
+        Some(path) => Some(path),
+    };
+    config.backup_ssh_target = config
+        .backup_ssh_target
+        .take()
+        .filter(|target| !target.trim().is_empty());
+    config.backup_s3_uri = config
+        .backup_s3_uri
+        .take()
+        .filter(|uri| !uri.trim().is_empty());
     for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
         if let Some(path) = path
             && path.is_relative()
@@ -1670,6 +1947,47 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         }
         if backup_dir == &config.jobs_dir {
             return Err("backup_dir must be different from jobs_dir.".to_owned());
+        }
+    }
+    let remote_ssh = config.backup_ssh_target.is_some();
+    let remote_s3 = config.backup_s3_uri.is_some();
+    if remote_ssh && remote_s3 {
+        return Err("Set either backup_ssh_target or backup_s3_uri, not both.".to_owned());
+    }
+    if (remote_ssh || remote_s3) && config.backup_dir.is_none() {
+        return Err("Remote backup requires backup_dir to be configured.".to_owned());
+    }
+    if config.backup_encryption_key_file.is_some() && !remote_ssh && !remote_s3 {
+        return Err("backup_encryption_key_file requires a remote backup destination.".to_owned());
+    }
+    if remote_ssh {
+        if config.backup_ssh_port == 0 {
+            return Err("backup_ssh_port must be greater than zero.".to_owned());
+        }
+        if split_ssh_target(config.backup_ssh_target.as_deref().unwrap_or("")).is_none() {
+            return Err("backup_ssh_target must use the form user@host:/absolute/dir.".to_owned());
+        }
+    }
+    if let Some(uri) = &config.backup_s3_uri
+        && (!uri.starts_with("s3://") || uri.len() <= 5)
+    {
+        return Err("backup_s3_uri must start with s3://.".to_owned());
+    }
+    if config.backup_remote_timeout_seconds == 0 {
+        return Err("backup_remote_timeout_seconds must be greater than zero.".to_owned());
+    }
+    if let Some(key) = &config.backup_encryption_key_file {
+        let metadata = fs::metadata(key).map_err(|error| {
+            format!(
+                "Cannot read backup encryption key {}: {error}",
+                key.display()
+            )
+        })?;
+        if !has_private_permissions(&metadata) {
+            return Err(format!(
+                "Backup encryption key {} must not be accessible by group or others (chmod 600).",
+                key.display()
+            ));
         }
     }
     if config.auth_failure_limit > 0 && config.auth_failure_window_seconds == 0 {
@@ -3520,6 +3838,14 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
             .map(|path| path.display().to_string()),
         "backup_interval_seconds": state.config.backup_interval_seconds,
         "backup_retention": state.config.backup_retention,
+        "backup_remote": if state.config.backup_ssh_target.is_some() {
+            "ssh"
+        } else if state.config.backup_s3_uri.is_some() {
+            "s3"
+        } else {
+            ""
+        },
+        "backup_encryption": state.config.backup_encryption_key_file.is_some(),
         "active_count": active_count,
         "recurring_count": recurring_count,
         "executed_today_count": executed_today_count,
@@ -3625,7 +3951,7 @@ async fn scheduler(state: Arc<AppState>) {
             });
             if due {
                 last_backup = Some(Instant::now());
-                run_backup(&state);
+                run_backup(&state).await;
             }
         }
     }
@@ -4214,6 +4540,18 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn parses_remote_backup_targets() {
+        assert_eq!(
+            split_ssh_target("user@host:/srv/backups/"),
+            Some(("user@host", "/srv/backups"))
+        );
+        assert_eq!(split_ssh_target("host:/tmp"), Some(("host", "/tmp")));
+        assert_eq!(split_ssh_target("host"), None);
+        assert_eq!(split_ssh_target("host:"), None);
+        assert_eq!(shell_quote("/tmp/a b's"), "'/tmp/a b'\\''s'");
     }
 
     #[test]

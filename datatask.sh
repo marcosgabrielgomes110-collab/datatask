@@ -395,6 +395,11 @@ history_file = "logs/history.jsonl"
 backup_dir = ""
 backup_interval_seconds = 86400
 backup_retention = 7
+backup_ssh_target = ""
+backup_ssh_port = 22
+backup_s3_uri = ""
+backup_encryption_key_file = ""
+backup_remote_timeout_seconds = 60
 EOF
   umask "$old_umask"
 }
@@ -585,6 +590,9 @@ cmd_setup() {
   local prev_cert prev_cert_set=0 prev_key prev_key_set=0
   local prev_backup_dir prev_backup_dir_set=0 prev_backup_interval prev_backup_interval_set=0
   local prev_backup_retention prev_backup_retention_set=0
+  local prev_backup_ssh prev_backup_ssh_set=0 prev_backup_port prev_backup_port_set=0
+  local prev_backup_s3 prev_backup_s3_set=0 prev_backup_key prev_backup_key_set=0
+  local prev_backup_timeout prev_backup_timeout_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -633,6 +641,26 @@ cmd_setup() {
   if grep -qE '^[[:space:]]*backup_retention[[:space:]]*=' "$conf"; then
     prev_backup_retention="$(config_get "$conf" backup_retention)"
     prev_backup_retention_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_ssh_target[[:space:]]*=' "$conf"; then
+    prev_backup_ssh="$(config_get "$conf" backup_ssh_target)"
+    prev_backup_ssh_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_ssh_port[[:space:]]*=' "$conf"; then
+    prev_backup_port="$(config_get "$conf" backup_ssh_port)"
+    prev_backup_port_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_s3_uri[[:space:]]*=' "$conf"; then
+    prev_backup_s3="$(config_get "$conf" backup_s3_uri)"
+    prev_backup_s3_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_encryption_key_file[[:space:]]*=' "$conf"; then
+    prev_backup_key="$(config_get "$conf" backup_encryption_key_file)"
+    prev_backup_key_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_remote_timeout_seconds[[:space:]]*=' "$conf"; then
+    prev_backup_timeout="$(config_get "$conf" backup_remote_timeout_seconds)"
+    prev_backup_timeout_set=1
   fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
@@ -704,6 +732,11 @@ cmd_setup() {
   [[ "$prev_backup_dir_set" -eq 1 ]] && config_set_string "$conf" backup_dir "$prev_backup_dir"
   [[ "$prev_backup_interval_set" -eq 1 ]] && config_set_raw "$conf" backup_interval_seconds "$prev_backup_interval"
   [[ "$prev_backup_retention_set" -eq 1 ]] && config_set_raw "$conf" backup_retention "$prev_backup_retention"
+  [[ "$prev_backup_ssh_set" -eq 1 ]] && config_set_string "$conf" backup_ssh_target "$prev_backup_ssh"
+  [[ "$prev_backup_port_set" -eq 1 ]] && config_set_raw "$conf" backup_ssh_port "$prev_backup_port"
+  [[ "$prev_backup_s3_set" -eq 1 ]] && config_set_string "$conf" backup_s3_uri "$prev_backup_s3"
+  [[ "$prev_backup_key_set" -eq 1 ]] && config_set_string "$conf" backup_encryption_key_file "$prev_backup_key"
+  [[ "$prev_backup_timeout_set" -eq 1 ]] && config_set_raw "$conf" backup_remote_timeout_seconds "$prev_backup_timeout"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then
@@ -1077,6 +1110,10 @@ prepare_service_files() {
   fi
   if [[ -n "$key_file" && "$key_file" != /* ]]; then
     config_set_string "$CONF_FILE" tls_key_file "${cert_base}/${key_file}"
+  fi
+  local backup_key; backup_key="$(config_get "$CONF_FILE" backup_encryption_key_file)"
+  if [[ -n "$backup_key" && "$backup_key" != /* ]]; then
+    config_set_string "$CONF_FILE" backup_encryption_key_file "${cert_base}/${backup_key}"
   fi
 
   # Se a config veio de outro lugar com caminhos relativos, ancora em DATA_DIR.

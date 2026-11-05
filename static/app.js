@@ -720,6 +720,8 @@
       ["Proxies confiáveis", info.trusted_proxy_ips?.length ? info.trusted_proxy_ips.join(", ") : "somente loopback"],
       ["Métricas", "/metrics (loopback ou token)"],
       ["Backup", info.backup_enabled ? `${info.backup_dir} · a cada ${info.backup_interval_seconds}s · ${info.backup_retention} cópias` : "desativado"],
+      ["Backup remoto", info.backup_remote || "desativado"],
+      ["Backup criptografado", info.backup_encryption ? "sim" : "não"],
       ["Tarefas cadastradas", String(info.job_count)],
       ["Tarefas ativas", String(info.active_count)],
       ["Executando agora", running ? `${running} (${info.running.join(", ")})` : "nenhuma"],

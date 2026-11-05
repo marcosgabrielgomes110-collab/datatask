@@ -59,5 +59,8 @@ advisory com crédito, se desejado.
   `backup_dir` em `700` e os arquivos em `600`, com retenção limitada. O
   sidecar `.sha256` detecta corrupção/tampering, mas não substitui permissões
   nem criptografia de disco.
+- O envio externo usa credenciais do ambiente (`ssh`/`aws`). O arquivo de
+  `backup_encryption_key_file` é uma senha GPG e deve ficar `600`; sem ele, o
+  JSON sobe em claro para o destino remoto.
 - Se você encontrar token em log, histórico de shell, issue ou commit, rotacione
   imediatamente e remova o segredo do histórico.
