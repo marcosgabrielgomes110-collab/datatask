@@ -208,6 +208,7 @@ struct AppState {
     last_tick: Arc<StdMutex<Option<Instant>>>,
     last_backup_verify: Arc<StdMutex<Option<BackupVerifySummary>>>,
     last_backup_alert: Arc<StdMutex<Option<String>>>,
+    verify_history: Arc<VerifyHistoryLog>,
     metrics: Arc<Metrics>,
     http_client: reqwest::Client,
 }
@@ -744,6 +745,96 @@ fn read_history_file(path: &FsPath, records: &mut Vec<RunRecord>) {
         match serde_json::from_str::<RunRecord>(line) {
             Ok(record) => records.push(record),
             Err(error) => eprintln!("Skipping invalid history entry: {error}"),
+        }
+    }
+}
+
+const VERIFY_HISTORY_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+struct VerifyHistoryLog {
+    path: PathBuf,
+    lock: StdMutex<()>,
+}
+
+impl VerifyHistoryLog {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            lock: StdMutex::new(()),
+        }
+    }
+
+    fn append(&self, summary: &BackupVerifySummary) {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Cannot create backup verification history directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+        if let Ok(metadata) = fs::metadata(&self.path)
+            && metadata.len() >= VERIFY_HISTORY_MAX_BYTES
+        {
+            let mut rotated = self.path.as_os_str().to_owned();
+            rotated.push(".1");
+            let rotated = PathBuf::from(rotated);
+            let _ = fs::remove_file(&rotated);
+            if let Err(error) = fs::rename(&self.path, &rotated) {
+                eprintln!("Cannot rotate backup verification history: {error}");
+            }
+        }
+        let line = match serde_json::to_string(summary) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("Cannot serialize backup verification history: {error}");
+                return;
+            }
+        };
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.path)
+        {
+            Ok(mut file) => {
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600));
+                if let Err(error) = writeln!(file, "{line}") {
+                    eprintln!("Cannot write backup verification history: {error}");
+                    return;
+                }
+                let _ = file.sync_data();
+            }
+            Err(error) => eprintln!(
+                "Cannot open backup verification history {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+
+    fn read(&self) -> Vec<BackupVerifySummary> {
+        let mut entries = Vec::new();
+        let mut rotated = self.path.as_os_str().to_owned();
+        rotated.push(".1");
+        read_verify_history_file(&PathBuf::from(rotated), &mut entries);
+        read_verify_history_file(&self.path, &mut entries);
+        entries
+    }
+}
+
+fn read_verify_history_file(path: &FsPath, entries: &mut Vec<BackupVerifySummary>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        match serde_json::from_str::<BackupVerifySummary>(line) {
+            Ok(summary) => entries.push(summary),
+            Err(error) => eprintln!("Skipping invalid backup verification entry: {error}"),
         }
     }
 }
@@ -1352,6 +1443,7 @@ async fn record_backup_verify(
             "items": summary.items,
         }));
     }
+    state.verify_history.append(summary);
 
     let key = backup_alert_key(summary);
     let should_send = {
@@ -1501,14 +1593,14 @@ struct BackupInfo {
     jobs: usize,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct BackupVerifyItem {
     name: String,
     ok: bool,
     error: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct BackupVerifySummary {
     timestamp: String,
     checked: usize,
@@ -1597,6 +1689,33 @@ fn list_backup_infos(config: &Config) -> Result<Vec<BackupInfo>, String> {
         }
     }
     Ok(items)
+}
+
+#[derive(Deserialize)]
+struct VerifyHistoryQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn get_backup_verifications(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<VerifyHistoryQuery>,
+) -> ApiResult<Json<Value>> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let mut entries = state.verify_history.read();
+    entries.reverse();
+    let total = entries.len();
+    let items: Vec<BackupVerifySummary> = entries.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 async fn get_backups(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
@@ -4462,6 +4581,12 @@ fn prepare_storage(config: &Config) -> std::io::Result<()> {
             }
         }
     }
+    for name in ["backup-verify.jsonl", "backup-verify.jsonl.1"] {
+        let path = config.logs_dir.join(name);
+        if path.is_file() {
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+    }
     Ok(())
 }
 
@@ -4583,6 +4708,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_tick: Arc::new(StdMutex::new(None)),
         last_backup_verify: Arc::new(StdMutex::new(None)),
         last_backup_alert: Arc::new(StdMutex::new(None)),
+        verify_history: Arc::new(VerifyHistoryLog::new(
+            config.logs_dir.join("backup-verify.jsonl"),
+        )),
         metrics: Arc::new(Metrics::new()),
         http_client,
     });
@@ -4592,6 +4720,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/info", get(get_info))
         .route("/api/history", get(get_history))
         .route("/api/backups", get(get_backups))
+        .route("/api/backups/verifications", get(get_backup_verifications))
         .route("/api/backups/verify", post(verify_backups))
         .route("/api/backups/{name}", get(get_backup_file))
         .route("/api/jobs", get(get_jobs).post(create_job))
@@ -4968,6 +5097,45 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn appends_and_reads_backup_verification_history() {
+        let directory = std::env::temp_dir().join(format!(
+            "datatask-verify-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let log = VerifyHistoryLog::new(directory.join("backup-verify.jsonl"));
+        let summary = BackupVerifySummary {
+            timestamp: "2026-11-06T00:00:00Z".to_owned(),
+            checked: 2,
+            ok: 1,
+            failed: 1,
+            items: vec![
+                BackupVerifyItem {
+                    name: "a.json".to_owned(),
+                    ok: true,
+                    error: None,
+                },
+                BackupVerifyItem {
+                    name: "b.json".to_owned(),
+                    ok: false,
+                    error: Some("checksum mismatch".to_owned()),
+                },
+            ],
+        };
+        log.append(&summary);
+        log.append(&summary);
+        let entries = log.read();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].failed, 1);
+        assert_eq!(entries[0].items[1].name, "b.json");
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

@@ -99,6 +99,8 @@
     backupsVerify: $("#backupsVerify"),
     backupsSummary: $("#backupsSummary"),
     backupsBody: $("#backupsBody"),
+    backupVerificationsSummary: $("#backupVerificationsSummary"),
+    backupVerificationsBody: $("#backupVerificationsBody"),
     jobDialog: $("#jobDialog"),
     jobForm: $("#jobForm"),
     formTitle: $("#formTitle"),
@@ -872,6 +874,7 @@
     if (name === "config") {
       renderServerInfo();
       loadBackups().catch(() => { /* mantém a última visão */ });
+      loadBackupVerifications().catch(() => { /* mantém a última visão */ });
     }
     if (name === "historico") {
       renderHistoryJobFilter();
@@ -1356,6 +1359,49 @@
   /* Ações de tarefa                                                        */
   /* ---------------------------------------------------------------------- */
 
+  async function loadBackupVerifications() {
+    if (!getToken()) {
+      el.backupVerificationsSummary.textContent = "Conecte-se para verificar o histórico.";
+      el.backupVerificationsBody.innerHTML = `<tr><td class="table-message" colspan="4">Conecte-se para verificar o histórico.</td></tr>`;
+      return;
+    }
+    try {
+      const data = await api("/api/backups/verifications?limit=20");
+      renderBackupVerifications(data);
+    } catch (error) {
+      el.backupVerificationsSummary.textContent = error.message;
+      el.backupVerificationsBody.innerHTML = `<tr><td class="table-message" colspan="4">${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
+  function renderBackupVerifications(data) {
+    const items = Array.isArray(data.items) ? data.items : [];
+    const total = Number(data.total) || 0;
+    el.backupVerificationsSummary.textContent = total
+      ? `${total} verificação(ões) registradas; mostrando as ${items.length} mais recentes.`
+      : "Nenhuma verificação registrada.";
+    if (!items.length) {
+      el.backupVerificationsBody.innerHTML = `<tr><td class="table-message" colspan="4">Nenhuma verificação registrada.</td></tr>`;
+      return;
+    }
+    el.backupVerificationsBody.innerHTML = items.map(item => {
+      const failed = Array.isArray(item.items) ? item.items.filter(entry => !entry.ok) : [];
+      const details = failed.length
+        ? failed.slice(0, 3).map(entry => `${entry.name}: ${entry.error || "falha"}`).join(" · ") +
+          (failed.length > 3 ? ` (+${failed.length - 3})` : "")
+        : "—";
+      const badge = item.failed
+        ? `<span class="result-badge result-error"><svg aria-hidden="true"><use href="#i-alert"/></svg>${item.failed} falha(s)</span>`
+        : `<span class="result-badge result-success"><svg aria-hidden="true"><use href="#i-check"/></svg>OK</span>`;
+      return `<tr>
+        <td>${escapeHtml(formatHistoryTime(item.timestamp))}</td>
+        <td>${item.ok}/${item.checked} ${badge}</td>
+        <td>${item.failed}</td>
+        <td>${escapeHtml(details)}</td>
+      </tr>`;
+    }).join("");
+  }
+
   async function loadBackups() {
     if (!getToken()) {
       el.backupsSummary.textContent = "Conecte-se para listar os backups.";
@@ -1542,6 +1588,7 @@
       }
       if (state.view === "config") {
         await loadBackups();
+        await loadBackupVerifications();
       }
     } catch (error) {
       toast(error.message, "error");
@@ -1898,6 +1945,8 @@
     el.statusFilter.value = "todas";
     el.backupsSummary.textContent = "Conecte-se para listar os backups.";
     el.backupsBody.innerHTML = `<tr><td class="table-message" colspan="6">Conecte-se para listar os backups.</td></tr>`;
+    el.backupVerificationsSummary.textContent = "Conecte-se para verificar o histórico.";
+    el.backupVerificationsBody.innerHTML = `<tr><td class="table-message" colspan="4">Conecte-se para verificar o histórico.</td></tr>`;
     renderAll();
     toast("Sessão encerrada.", "info");
   }
@@ -1950,6 +1999,7 @@
       try {
         await refreshData({ silent: true });
         await loadBackups();
+        await loadBackupVerifications();
         toast("Informações atualizadas.", "success");
       } catch (error) {
         toast(error.message, "error");
@@ -1957,6 +2007,7 @@
     });
     el.backupsRefresh.addEventListener("click", () => {
       loadBackups().catch(error => toast(error.message, "error"));
+      loadBackupVerifications().catch(error => toast(error.message, "error"));
     });
     el.backupsVerify.addEventListener("click", async () => {
       if (!getToken()) {
@@ -1972,6 +2023,7 @@
         );
         await refreshData({ silent: true });
         await loadBackups();
+        await loadBackupVerifications();
       } catch (error) {
         toast(error.message, "error");
       }
