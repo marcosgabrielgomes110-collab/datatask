@@ -726,6 +726,7 @@
       ["Última verificação", info.backup_last_verify
         ? `${info.backup_last_verify.ok}/${info.backup_last_verify.checked} OK · ${formatHistoryTime(info.backup_last_verify.timestamp)}`
         : "nunca"],
+      ["Alertas de backup", info.backup_alert_enabled ? "ativos" : "desativados"],
       ["Tarefas cadastradas", String(info.job_count)],
       ["Tarefas ativas", String(info.active_count)],
       ["Executando agora", running ? `${running} (${info.running.join(", ")})` : "nenhuma"],

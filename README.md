@@ -46,6 +46,8 @@ backup_retention = 7
 # backup_encryption_key_file = "/etc/datatask/backup.key"
 backup_remote_timeout_seconds = 60
 backup_verify_interval_seconds = 86400
+# backup_alert_url = "https://exemplo.com/datatask-alert"
+backup_alert_url = ""
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -88,7 +90,8 @@ No `install`, caminhos relativos de backup são ancorados em `/var/lib/datatask`
 `backup_ssh_target` ou `backup_s3_uri` enviam uma cópia externa; com
 `backup_encryption_key_file`, o artefato remoto é cifrado com GPG.
 `backup_verify_interval_seconds` faz a verificação periódica dos checksums no
-destino (`0` desativa).
+destino (`0` desativa). `backup_alert_url` recebe um POST quando a verificação
+falha ou não há backups remotos.
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -580,6 +583,12 @@ disparar a checagem:
 curl -X POST -H "Authorization: Bearer ${DATATASK_API_TOKEN}" \
   http://127.0.0.1:8080/api/backups/verify
 ```
+
+Se `backup_alert_url` estiver configurado, uma falha de checksum ou ausência de
+backups remotos dispara um POST com `event` (`backup.verify_failed` ou
+`backup.missing`), timestamp, destino, contagens e os itens com erro. Alertas
+repetidos com o mesmo conjunto de falhas são deduplicados até o estado mudar;
+o envio é auditado como `backup.alert`.
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:

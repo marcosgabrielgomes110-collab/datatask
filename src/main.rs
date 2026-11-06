@@ -118,6 +118,9 @@ struct Config {
     /// Periodic remote checksum verification. `0` disables the periodic check.
     #[serde(default = "default_backup_verify_interval_seconds")]
     backup_verify_interval_seconds: u64,
+    /// Optional webhook called when remote verification fails or has no backups.
+    #[serde(default)]
+    backup_alert_url: Option<String>,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -204,6 +207,7 @@ struct AppState {
     history: Option<Arc<HistoryLog>>,
     last_tick: Arc<StdMutex<Option<Instant>>>,
     last_backup_verify: Arc<StdMutex<Option<BackupVerifySummary>>>,
+    last_backup_alert: Arc<StdMutex<Option<String>>>,
     metrics: Arc<Metrics>,
     http_client: reqwest::Client,
 }
@@ -1267,7 +1271,67 @@ async fn verify_remote_backups(
     })
 }
 
-fn record_backup_verify(state: &AppState, target: &RemoteTarget, summary: &BackupVerifySummary) {
+fn backup_alert_key(summary: &BackupVerifySummary) -> Option<String> {
+    if summary.checked == 0 {
+        return Some("missing".to_owned());
+    }
+    if summary.failed > 0 {
+        let mut names: Vec<&str> = summary
+            .items
+            .iter()
+            .filter(|item| !item.ok)
+            .map(|item| item.name.as_str())
+            .collect();
+        names.sort();
+        return Some(format!("failed:{}", names.join(",")));
+    }
+    None
+}
+
+async fn send_backup_alert(state: &AppState, target: &RemoteTarget, summary: &BackupVerifySummary) {
+    let Some(url) = state.config.backup_alert_url.as_deref() else {
+        return;
+    };
+    let event = if summary.checked == 0 {
+        "backup.missing"
+    } else {
+        "backup.verify_failed"
+    };
+    let payload = json!({
+        "event": event,
+        "timestamp": summary.timestamp,
+        "remote": target.label(),
+        "checked": summary.checked,
+        "ok": summary.ok,
+        "failed": summary.failed,
+        "items": summary.items,
+    });
+    match state.http_client.post(url).json(&payload).send().await {
+        Ok(response) => {
+            let status = response.status();
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.alert",
+                "status": status.as_u16(),
+                "alert": event,
+            }));
+        }
+        Err(error) => {
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.alert",
+                "error": error.to_string(),
+                "alert": event,
+            }));
+        }
+    }
+}
+
+async fn record_backup_verify(
+    state: &AppState,
+    target: &RemoteTarget,
+    summary: &BackupVerifySummary,
+) {
     *state
         .last_backup_verify
         .lock()
@@ -1288,6 +1352,23 @@ fn record_backup_verify(state: &AppState, target: &RemoteTarget, summary: &Backu
             "items": summary.items,
         }));
     }
+
+    let key = backup_alert_key(summary);
+    let should_send = {
+        let mut last = state
+            .last_backup_alert
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.as_ref() == key.as_ref() {
+            false
+        } else {
+            *last = key.clone();
+            true
+        }
+    };
+    if should_send {
+        send_backup_alert(state, target, summary).await;
+    }
 }
 
 async fn run_remote_verify(state: Arc<AppState>) {
@@ -1301,7 +1382,7 @@ async fn run_remote_verify(state: Arc<AppState>) {
     };
     let timeout = Duration::from_secs(state.config.backup_remote_timeout_seconds);
     match verify_remote_backups(&target, timeout).await {
-        Ok(summary) => record_backup_verify(&state, &target, &summary),
+        Ok(summary) => record_backup_verify(&state, &target, &summary).await,
         Err(error) => {
             eprintln!("Remote backup verification failed: {error}");
             state.audit(json!({
@@ -1322,7 +1403,7 @@ async fn verify_backups(State(state): State<Arc<AppState>>) -> ApiResult<Json<Va
     let summary = verify_remote_backups(&target, timeout)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    record_backup_verify(&state, &target, &summary);
+    record_backup_verify(&state, &target, &summary).await;
     Ok(Json(json!(summary)))
 }
 
@@ -2209,6 +2290,14 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         .backup_s3_uri
         .take()
         .filter(|uri| !uri.trim().is_empty());
+    config.backup_alert_url = config
+        .backup_alert_url
+        .take()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty());
+    if let Some(url) = &config.backup_alert_url {
+        normalize_notify_url(Some(url)).map_err(|error| error.1)?;
+    }
     for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
         if let Some(path) = path
             && path.is_relative()
@@ -2259,6 +2348,9 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     }
     if config.backup_encryption_key_file.is_some() && !remote_ssh && !remote_s3 {
         return Err("backup_encryption_key_file requires a remote backup destination.".to_owned());
+    }
+    if config.backup_alert_url.is_some() && !remote_ssh && !remote_s3 {
+        return Err("backup_alert_url requires a remote backup destination.".to_owned());
     }
     if remote_ssh {
         if config.backup_ssh_port == 0 {
@@ -4152,6 +4244,7 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         },
         "backup_encryption": state.config.backup_encryption_key_file.is_some(),
         "backup_verify_interval_seconds": state.config.backup_verify_interval_seconds,
+        "backup_alert_enabled": state.config.backup_alert_url.is_some(),
         "backup_last_verify": last_backup_verify,
         "active_count": active_count,
         "recurring_count": recurring_count,
@@ -4489,6 +4582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         history,
         last_tick: Arc::new(StdMutex::new(None)),
         last_backup_verify: Arc::new(StdMutex::new(None)),
+        last_backup_alert: Arc::new(StdMutex::new(None)),
         metrics: Arc::new(Metrics::new()),
         http_client,
     });
@@ -4874,6 +4968,33 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn builds_deduplicated_backup_alert_keys() {
+        let summary = |checked: usize, failed_items: Vec<(&str, bool)>| BackupVerifySummary {
+            timestamp: "2026-11-06T00:00:00Z".to_owned(),
+            checked,
+            ok: failed_items.iter().filter(|(_, ok)| *ok).count(),
+            failed: failed_items.iter().filter(|(_, ok)| !*ok).count(),
+            items: failed_items
+                .into_iter()
+                .map(|(name, ok)| BackupVerifyItem {
+                    name: name.to_owned(),
+                    ok,
+                    error: (!ok).then(|| "checksum mismatch".to_owned()),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            backup_alert_key(&summary(0, vec![])),
+            Some("missing".to_owned())
+        );
+        assert_eq!(
+            backup_alert_key(&summary(2, vec![("b.json", true), ("a.json", false)])),
+            Some("failed:a.json".to_owned())
+        );
+        assert_eq!(backup_alert_key(&summary(1, vec![("a.json", true)])), None);
     }
 
     #[test]

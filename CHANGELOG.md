@@ -46,6 +46,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 - Verificação periódica de integridade dos backups remotos
   (`backup_verify_interval_seconds`) e endpoint manual
   `POST /api/backups/verify`.
+- Alertas por webhook (`backup_alert_url`) em falha de verificação ou ausência
+  de backups remotos, com deduplicação e auditoria.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

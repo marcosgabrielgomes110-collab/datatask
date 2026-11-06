@@ -52,6 +52,8 @@ advisory com crédito, se desejado.
 - `notify_url` permite que quem possui o token faça o servidor enviar POSTs
   para destinos arbitrários (potencial SSRF). Redirecionamentos não são
   seguidos; mantenha o token restrito e use apenas destinos confiáveis.
+- `backup_alert_url` tem o mesmo risco de SSRF do webhook de jobs; use somente
+  destinos confiáveis e proteja o token.
 - A exportação inclui `action` e `notify_url` dos jobs, que podem conter
   segredos. Trate o JSON exportado como credencial (`600`) e não o publique.
   A importação pode sobrescrever jobs existentes; revise a prévia antes.
