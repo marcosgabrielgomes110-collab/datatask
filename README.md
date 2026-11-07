@@ -417,6 +417,8 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
   padrão 50 (máx. 200)
 - `GET /api/backups` — lista backups automáticos com tamanho, data, contagem de
   jobs e status do checksum SHA-256
+- `GET /api/backups/health` — resumo consolidado (status, último upload,
+  retenção, verificação e problemas)
 - `POST /api/backups/verify` — baixa e verifica os checksums no destino remoto
 - `GET /api/backups/verifications?limit=&offset=` — histórico persistente das
   verificações, mais recentes primeiro
@@ -594,7 +596,10 @@ o envio é auditado como `backup.alert`.
 
 Cada verificação também é persistida em `logs/backup-verify.jsonl` (`600`,
 rotação de 5 MiB) e exibida em **Configurações → Backups → Verificações
-recentes**, com data, contagens e detalhes das falhas.
+recentes**, com data, contagens e detalhes das falhas. No topo do cartão, um
+indicador consolidado mostra `OK`, `Atenção`, `Erro` ou `Desativado`, com
+local/remoto, retenção, último upload, última verificação e a lista de
+problemas.
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:

@@ -97,6 +97,9 @@
     serverInfo: $("#serverInfo"),
     backupsRefresh: $("#backupsRefresh"),
     backupsVerify: $("#backupsVerify"),
+    backupHealthStatus: $("#backupHealthStatus"),
+    backupHealthTitle: $("#backupHealthTitle"),
+    backupHealthDetails: $("#backupHealthDetails"),
     backupsSummary: $("#backupsSummary"),
     backupsBody: $("#backupsBody"),
     backupVerificationsSummary: $("#backupVerificationsSummary"),
@@ -875,6 +878,7 @@
       renderServerInfo();
       loadBackups().catch(() => { /* mantém a última visão */ });
       loadBackupVerifications().catch(() => { /* mantém a última visão */ });
+      loadBackupHealth().catch(() => { /* mantém a última visão */ });
     }
     if (name === "historico") {
       renderHistoryJobFilter();
@@ -1402,6 +1406,47 @@
     }).join("");
   }
 
+  async function loadBackupHealth() {
+    if (!getToken()) {
+      el.backupHealthStatus.className = "result-badge";
+      el.backupHealthStatus.textContent = "—";
+      el.backupHealthTitle.textContent = "Status dos backups";
+      el.backupHealthDetails.textContent = "Conecte-se para carregar o resumo.";
+      return;
+    }
+    try {
+      renderBackupHealth(await api("/api/backups/health"));
+    } catch (error) {
+      el.backupHealthStatus.className = "result-badge result-error";
+      el.backupHealthStatus.textContent = "Erro";
+      el.backupHealthTitle.textContent = "Não foi possível consultar os backups";
+      el.backupHealthDetails.textContent = error.message;
+    }
+  }
+
+  function renderBackupHealth(data) {
+    const meta = {
+      ok: { className: "result-success", label: "OK", title: "Backups saudáveis" },
+      warning: { className: "result-timeout", label: "Atenção", title: "Atenção nos backups" },
+      error: { className: "result-error", label: "Erro", title: "Falha nos backups" },
+      disabled: { className: "", label: "Desativado", title: "Backups desativados" }
+    }[data.status] || { className: "", label: "—", title: "Status dos backups" };
+    el.backupHealthStatus.className = `result-badge ${meta.className}`.trim();
+    el.backupHealthStatus.textContent = meta.label;
+    el.backupHealthTitle.textContent = meta.title;
+    const parts = [
+      `local: ${data.local_count || 0}`,
+      `remoto: ${data.remote || "desativado"}`,
+      `retenção: ${data.retention ?? "—"}`,
+      `último upload: ${data.last_upload ? formatHistoryTime(data.last_upload.timestamp) : "—"}`,
+      `última verificação: ${data.last_verify ? formatHistoryTime(data.last_verify.timestamp) : "—"}`
+    ];
+    const problems = Array.isArray(data.problems) && data.problems.length
+      ? ` Problemas: ${data.problems.join("; ")}.`
+      : "";
+    el.backupHealthDetails.textContent = `${parts.join(" · ")}.${problems}`;
+  }
+
   async function loadBackups() {
     if (!getToken()) {
       el.backupsSummary.textContent = "Conecte-se para listar os backups.";
@@ -1589,6 +1634,7 @@
       if (state.view === "config") {
         await loadBackups();
         await loadBackupVerifications();
+        await loadBackupHealth();
       }
     } catch (error) {
       toast(error.message, "error");
@@ -1947,6 +1993,10 @@
     el.backupsBody.innerHTML = `<tr><td class="table-message" colspan="6">Conecte-se para listar os backups.</td></tr>`;
     el.backupVerificationsSummary.textContent = "Conecte-se para verificar o histórico.";
     el.backupVerificationsBody.innerHTML = `<tr><td class="table-message" colspan="4">Conecte-se para verificar o histórico.</td></tr>`;
+    el.backupHealthStatus.className = "result-badge";
+    el.backupHealthStatus.textContent = "—";
+    el.backupHealthTitle.textContent = "Status dos backups";
+    el.backupHealthDetails.textContent = "Conecte-se para carregar o resumo.";
     renderAll();
     toast("Sessão encerrada.", "info");
   }
@@ -2000,6 +2050,7 @@
         await refreshData({ silent: true });
         await loadBackups();
         await loadBackupVerifications();
+        await loadBackupHealth();
         toast("Informações atualizadas.", "success");
       } catch (error) {
         toast(error.message, "error");
@@ -2008,6 +2059,7 @@
     el.backupsRefresh.addEventListener("click", () => {
       loadBackups().catch(error => toast(error.message, "error"));
       loadBackupVerifications().catch(error => toast(error.message, "error"));
+      loadBackupHealth().catch(error => toast(error.message, "error"));
     });
     el.backupsVerify.addEventListener("click", async () => {
       if (!getToken()) {
@@ -2024,6 +2076,7 @@
         await refreshData({ silent: true });
         await loadBackups();
         await loadBackupVerifications();
+        await loadBackupHealth();
       } catch (error) {
         toast(error.message, "error");
       }

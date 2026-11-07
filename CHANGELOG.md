@@ -50,6 +50,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   de backups remotos, com deduplicação e auditoria.
 - Histórico persistente das verificações em `logs/backup-verify.jsonl`, com API
   (`/api/backups/verifications`) e tabela no painel.
+- Resumo consolidado de saúde dos backups (`/api/backups/health` e indicador no
+  painel) com upload, retenção, verificação, alertas e problemas.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

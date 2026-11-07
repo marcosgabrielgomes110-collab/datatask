@@ -209,6 +209,7 @@ struct AppState {
     last_backup_verify: Arc<StdMutex<Option<BackupVerifySummary>>>,
     last_backup_alert: Arc<StdMutex<Option<String>>>,
     verify_history: Arc<VerifyHistoryLog>,
+    backup_health: Arc<StdMutex<BackupHealth>>,
     metrics: Arc<Metrics>,
     http_client: reqwest::Client,
 }
@@ -223,6 +224,23 @@ impl AppState {
     fn record_history(&self, record: RunRecord) {
         if let Some(history) = &self.history {
             history.append(&record);
+        }
+    }
+
+    fn record_backup_event(&self, kind: BackupEventKind, ok: bool, detail: Option<String>) {
+        let event = BackupEvent {
+            timestamp: Local::now().to_rfc3339(),
+            ok,
+            detail,
+        };
+        let mut health = self
+            .backup_health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match kind {
+            BackupEventKind::Upload => health.last_upload = Some(event),
+            BackupEventKind::Prune => health.last_prune = Some(event),
+            BackupEventKind::Alert => health.last_alert = Some(event),
         }
     }
 }
@@ -1400,6 +1418,11 @@ async fn send_backup_alert(state: &AppState, target: &RemoteTarget, summary: &Ba
     match state.http_client.post(url).json(&payload).send().await {
         Ok(response) => {
             let status = response.status();
+            state.record_backup_event(
+                BackupEventKind::Alert,
+                status.is_success(),
+                Some(format!("HTTP {}", status.as_u16())),
+            );
             state.audit(json!({
                 "ts": Local::now().to_rfc3339(),
                 "event": "backup.alert",
@@ -1408,6 +1431,7 @@ async fn send_backup_alert(state: &AppState, target: &RemoteTarget, summary: &Ba
             }));
         }
         Err(error) => {
+            state.record_backup_event(BackupEventKind::Alert, false, Some(error.to_string()));
             state.audit(json!({
                 "ts": Local::now().to_rfc3339(),
                 "event": "backup.alert",
@@ -1524,6 +1548,11 @@ async fn run_backup(state: Arc<AppState>) {
                     let timeout = Duration::from_secs(state.config.backup_remote_timeout_seconds);
                     match upload_backup(&state, &path, &checksum).await {
                         Ok((file, remote_checksum)) => {
+                            state.record_backup_event(
+                                BackupEventKind::Upload,
+                                true,
+                                Some(file.clone()),
+                            );
                             state.audit(json!({
                                 "ts": Local::now().to_rfc3339(),
                                 "event": "backup.uploaded",
@@ -1538,14 +1567,27 @@ async fn run_backup(state: Arc<AppState>) {
                             )
                             .await
                             {
-                                Ok(0) => {}
-                                Ok(deleted) => state.audit(json!({
-                                    "ts": Local::now().to_rfc3339(),
-                                    "event": "backup.pruned",
-                                    "remote": target.label(),
-                                    "deleted": deleted,
-                                })),
+                                Ok(deleted) => {
+                                    state.record_backup_event(
+                                        BackupEventKind::Prune,
+                                        true,
+                                        Some(format!("{deleted} removidos")),
+                                    );
+                                    if deleted > 0 {
+                                        state.audit(json!({
+                                            "ts": Local::now().to_rfc3339(),
+                                            "event": "backup.pruned",
+                                            "remote": target.label(),
+                                            "deleted": deleted,
+                                        }));
+                                    }
+                                }
                                 Err(error) => {
+                                    state.record_backup_event(
+                                        BackupEventKind::Prune,
+                                        false,
+                                        Some(error.clone()),
+                                    );
                                     eprintln!("Remote backup prune failed: {error}");
                                     state.audit(json!({
                                         "ts": Local::now().to_rfc3339(),
@@ -1557,6 +1599,11 @@ async fn run_backup(state: Arc<AppState>) {
                             }
                         }
                         Err(error) => {
+                            state.record_backup_event(
+                                BackupEventKind::Upload,
+                                false,
+                                Some(error.clone()),
+                            );
                             eprintln!("Remote backup upload failed: {error}");
                             state.audit(json!({
                                 "ts": Local::now().to_rfc3339(),
@@ -1582,7 +1629,7 @@ async fn run_backup(state: Arc<AppState>) {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct BackupInfo {
     name: String,
     size: u64,
@@ -1591,6 +1638,27 @@ struct BackupInfo {
     checksum_ok: bool,
     valid_json: bool,
     jobs: usize,
+}
+
+#[derive(Clone, Copy)]
+enum BackupEventKind {
+    Upload,
+    Prune,
+    Alert,
+}
+
+#[derive(Clone, Serialize)]
+struct BackupEvent {
+    timestamp: String,
+    ok: bool,
+    detail: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct BackupHealth {
+    last_upload: Option<BackupEvent>,
+    last_prune: Option<BackupEvent>,
+    last_alert: Option<BackupEvent>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1715,6 +1783,102 @@ async fn get_backup_verifications(
         "total": total,
         "limit": limit,
         "offset": offset,
+    })))
+}
+
+async fn get_backup_health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let enabled = state.config.backup_dir.is_some();
+    let local = list_backup_infos(&state.config)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let latest_local = local.first().cloned();
+    let last_verify = state
+        .last_backup_verify
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let health = state
+        .backup_health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let remote = if state.config.backup_ssh_target.is_some() {
+        "ssh"
+    } else if state.config.backup_s3_uri.is_some() {
+        "s3"
+    } else {
+        ""
+    };
+    let mut status = if enabled { "ok" } else { "disabled" };
+    let mut problems: Vec<String> = Vec::new();
+    if !enabled {
+        problems.push("backup_dir não configurado".to_owned());
+    } else {
+        if local.is_empty() {
+            status = "warning";
+            problems.push("nenhum backup local encontrado".to_owned());
+        }
+        if remote.is_empty() {
+            if status == "ok" {
+                status = "warning";
+            }
+            problems.push("destino remoto não configurado".to_owned());
+        }
+        match &last_verify {
+            Some(summary) if summary.failed > 0 => {
+                status = "error";
+                problems.push(format!(
+                    "{} falha(s) na última verificação remota",
+                    summary.failed
+                ));
+            }
+            Some(summary) if summary.checked == 0 => {
+                if status != "error" {
+                    status = "warning";
+                }
+                problems.push("nenhum backup remoto encontrado".to_owned());
+            }
+            None if !remote.is_empty() => {
+                if status != "error" {
+                    status = "warning";
+                }
+                problems.push("nenhuma verificação remota executada".to_owned());
+            }
+            _ => {}
+        }
+        if health.last_upload.as_ref().is_some_and(|event| !event.ok) {
+            status = "error";
+            problems.push("o último upload remoto falhou".to_owned());
+        }
+        if health.last_prune.as_ref().is_some_and(|event| !event.ok) {
+            if status != "error" {
+                status = "warning";
+            }
+            problems.push("a última limpeza remota falhou".to_owned());
+        }
+        if health.last_alert.as_ref().is_some_and(|event| !event.ok) {
+            if status != "error" {
+                status = "warning";
+            }
+            problems.push("o último alerta não foi entregue".to_owned());
+        }
+    }
+
+    Ok(Json(json!({
+        "status": status,
+        "enabled": enabled,
+        "remote": remote,
+        "encryption": state.config.backup_encryption_key_file.is_some(),
+        "alerts_enabled": state.config.backup_alert_url.is_some(),
+        "retention": state.config.backup_retention,
+        "verify_interval_seconds": state.config.backup_verify_interval_seconds,
+        "local_count": local.len(),
+        "latest_local": latest_local,
+        "last_upload": health.last_upload,
+        "last_prune": health.last_prune,
+        "last_alert": health.last_alert,
+        "last_verify": last_verify,
+        "problems": problems,
+        "now": Local::now().to_rfc3339(),
     })))
 }
 
@@ -4711,6 +4875,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verify_history: Arc::new(VerifyHistoryLog::new(
             config.logs_dir.join("backup-verify.jsonl"),
         )),
+        backup_health: Arc::new(StdMutex::new(BackupHealth::default())),
         metrics: Arc::new(Metrics::new()),
         http_client,
     });
@@ -4720,6 +4885,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/info", get(get_info))
         .route("/api/history", get(get_history))
         .route("/api/backups", get(get_backups))
+        .route("/api/backups/health", get(get_backup_health))
         .route("/api/backups/verifications", get(get_backup_verifications))
         .route("/api/backups/verify", post(verify_backups))
         .route("/api/backups/{name}", get(get_backup_file))
