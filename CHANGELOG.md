@@ -52,6 +52,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   (`/api/backups/verifications`) e tabela no painel.
 - Resumo consolidado de saúde dos backups (`/api/backups/health` e indicador no
   painel) com upload, retenção, verificação, alertas e problemas.
+- Exportação do relatório de saúde em JSON/CSV
+  (`/api/backups/health/export`) com histórico de verificações e problemas.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

@@ -97,6 +97,8 @@
     serverInfo: $("#serverInfo"),
     backupsRefresh: $("#backupsRefresh"),
     backupsVerify: $("#backupsVerify"),
+    backupsExportJson: $("#backupsExportJson"),
+    backupsExportCsv: $("#backupsExportCsv"),
     backupHealthStatus: $("#backupHealthStatus"),
     backupHealthTitle: $("#backupHealthTitle"),
     backupHealthDetails: $("#backupHealthDetails"),
@@ -1447,6 +1449,41 @@
     el.backupHealthDetails.textContent = `${parts.join(" · ")}.${problems}`;
   }
 
+  async function exportBackupHealth(format) {
+    const token = getToken();
+    if (!token) {
+      toast("Conecte-se à API para exportar.", "error");
+      return;
+    }
+    try {
+      const response = await fetch(`/api/backups/health/export?format=${encodeURIComponent(format)}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        if (response.status === 401) {
+          setToken("");
+          setConnection("offline", "Token inválido");
+        }
+        throw new Error(`Erro HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename="([^"]+)"/);
+      const filename = match ? match[1] : `datatask-backup-health.${format}`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast(`Relatório ${format.toUpperCase()} gerado.`, "success");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
   async function loadBackups() {
     if (!getToken()) {
       el.backupsSummary.textContent = "Conecte-se para listar os backups.";
@@ -2060,6 +2097,12 @@
       loadBackups().catch(error => toast(error.message, "error"));
       loadBackupVerifications().catch(error => toast(error.message, "error"));
       loadBackupHealth().catch(error => toast(error.message, "error"));
+    });
+    el.backupsExportJson.addEventListener("click", () => {
+      exportBackupHealth("json").catch(error => toast(error.message, "error"));
+    });
+    el.backupsExportCsv.addEventListener("click", () => {
+      exportBackupHealth("csv").catch(error => toast(error.message, "error"));
     });
     el.backupsVerify.addEventListener("click", async () => {
       if (!getToken()) {

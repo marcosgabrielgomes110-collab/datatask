@@ -419,6 +419,8 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
   jobs e status do checksum SHA-256
 - `GET /api/backups/health` — resumo consolidado (status, último upload,
   retenção, verificação e problemas)
+- `GET /api/backups/health/export?format=json|csv` — relatório para auditoria
+  externa com resumo, eventos e histórico de verificações
 - `POST /api/backups/verify` — baixa e verifica os checksums no destino remoto
 - `GET /api/backups/verifications?limit=&offset=` — histórico persistente das
   verificações, mais recentes primeiro
@@ -599,7 +601,9 @@ rotação de 5 MiB) e exibida em **Configurações → Backups → Verificaçõe
 recentes**, com data, contagens e detalhes das falhas. No topo do cartão, um
 indicador consolidado mostra `OK`, `Atenção`, `Erro` ou `Desativado`, com
 local/remoto, retenção, último upload, última verificação e a lista de
-problemas.
+problemas. Os botões **JSON** e **CSV** exportam esse resumo e o histórico de
+verificações para auditoria externa; o CSV traz uma linha por verificação (ou
+uma linha de resumo quando ainda não há histórico).
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:

@@ -1786,7 +1786,7 @@ async fn get_backup_verifications(
     })))
 }
 
-async fn get_backup_health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+fn backup_health_snapshot(state: &AppState) -> ApiResult<Value> {
     let enabled = state.config.backup_dir.is_some();
     let local = list_backup_infos(&state.config)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
@@ -1863,7 +1863,7 @@ async fn get_backup_health(State(state): State<Arc<AppState>>) -> ApiResult<Json
         }
     }
 
-    Ok(Json(json!({
+    Ok(json!({
         "status": status,
         "enabled": enabled,
         "remote": remote,
@@ -1879,7 +1879,149 @@ async fn get_backup_health(State(state): State<Arc<AppState>>) -> ApiResult<Json
         "last_verify": last_verify,
         "problems": problems,
         "now": Local::now().to_rfc3339(),
-    })))
+    }))
+}
+
+async fn get_backup_health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    Ok(Json(backup_health_snapshot(&state)?))
+}
+
+#[derive(Deserialize)]
+struct HealthExportQuery {
+    format: Option<String>,
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn health_csv(health: &Value, verifications: &[BackupVerifySummary]) -> String {
+    let mut output = String::new();
+    let problems = health["problems"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    let generated = health["now"].as_str().unwrap_or("");
+    let status = health["status"].as_str().unwrap_or("");
+    let remote = health["remote"].as_str().unwrap_or("");
+    let last_upload_at = health["last_upload"]["timestamp"].as_str().unwrap_or("");
+    let last_upload_ok = health["last_upload"]["ok"]
+        .as_bool()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let last_alert_at = health["last_alert"]["timestamp"].as_str().unwrap_or("");
+    let last_alert_ok = health["last_alert"]["ok"]
+        .as_bool()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let _ = writeln!(
+        output,
+        "generated_at,status,remote,retention,local_count,last_upload_at,last_upload_ok,last_alert_at,last_alert_ok,verification_at,checked,ok,failed,problems"
+    );
+    if verifications.is_empty() {
+        let _ = writeln!(
+            output,
+            "{},{},{},{},{},{},{},{},{},,,,,{}",
+            csv_field(generated),
+            csv_field(status),
+            csv_field(remote),
+            health["retention"].as_u64().unwrap_or(0),
+            health["local_count"].as_u64().unwrap_or(0),
+            csv_field(last_upload_at),
+            csv_field(&last_upload_ok),
+            csv_field(last_alert_at),
+            csv_field(&last_alert_ok),
+            csv_field(&problems),
+        );
+    } else {
+        for entry in verifications {
+            let _ = writeln!(
+                output,
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                csv_field(generated),
+                csv_field(status),
+                csv_field(remote),
+                health["retention"].as_u64().unwrap_or(0),
+                health["local_count"].as_u64().unwrap_or(0),
+                csv_field(last_upload_at),
+                csv_field(&last_upload_ok),
+                csv_field(last_alert_at),
+                csv_field(&last_alert_ok),
+                csv_field(&entry.timestamp),
+                entry.checked,
+                entry.ok,
+                entry.failed,
+                csv_field(&problems),
+            );
+        }
+    }
+    output
+}
+
+async fn export_backup_health(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HealthExportQuery>,
+) -> ApiResult<Response> {
+    let health = backup_health_snapshot(&state)?;
+    let format = query.format.as_deref().unwrap_or("json");
+    let mut verifications = state.verify_history.read();
+    verifications.reverse();
+    verifications.truncate(1000);
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    match format {
+        "json" => {
+            let document = json!({
+                "format": "datatask.backup-health",
+                "version": 1,
+                "generated_at": health["now"],
+                "health": health,
+                "verifications": verifications,
+            });
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!(
+                    "attachment; filename=\"datatask-backup-health-{timestamp}.json\""
+                ))
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Invalid filename."))?,
+            );
+            Ok((headers, Json(document)).into_response())
+        }
+        "csv" => {
+            let body = health_csv(&health, &verifications);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/csv; charset=utf-8"),
+            );
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!(
+                    "attachment; filename=\"datatask-backup-health-{timestamp}.csv\""
+                ))
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Invalid filename."))?,
+            );
+            Ok((headers, body).into_response())
+        }
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "format must be json or csv.",
+        )),
+    }
 }
 
 async fn get_backups(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
@@ -4886,6 +5028,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/history", get(get_history))
         .route("/api/backups", get(get_backups))
         .route("/api/backups/health", get(get_backup_health))
+        .route("/api/backups/health/export", get(export_backup_health))
         .route("/api/backups/verifications", get(get_backup_verifications))
         .route("/api/backups/verify", post(verify_backups))
         .route("/api/backups/{name}", get(get_backup_file))
@@ -5263,6 +5406,24 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn exports_backup_health_csv() {
+        let health = json!({
+            "status": "ok",
+            "remote": "ssh",
+            "retention": 7,
+            "local_count": 2,
+            "last_upload": {"timestamp": "2026-11-07T00:00:00Z", "ok": true},
+            "last_alert": {"timestamp": "2026-11-07T00:00:01Z", "ok": false},
+            "problems": [],
+            "now": "2026-11-07T00:00:02Z"
+        });
+        let csv = health_csv(&health, &[]);
+        assert!(csv.starts_with("generated_at,status,remote,retention,local_count"));
+        assert!(csv.contains(",ok,ssh,7,2,2026-11-07T00:00:00Z,true"));
+        assert!(csv.contains("2026-11-07T00:00:01Z,false,,,,"));
     }
 
     #[test]
