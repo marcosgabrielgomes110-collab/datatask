@@ -7,6 +7,7 @@ edition = "2024"
 axum = "0.8"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 chrono = { version = "0.4", features = ["serde"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "hostname", "pool"] }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws-lc-rs"] }

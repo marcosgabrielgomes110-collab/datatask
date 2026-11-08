@@ -51,6 +51,15 @@ backup_alert_url = ""
 # backup_health_report_url = "https://exemplo.com/datatask-report"
 backup_health_report_url = ""
 backup_health_report_interval_seconds = 86400
+backup_health_report_email = false
+# SMTP para envio direto do relatório (security: starttls|tls|none).
+# smtp_host = "smtp.exemplo.com"
+# smtp_port = 587
+# smtp_username = "datatask"
+# smtp_password_file = "/etc/datatask/smtp.pass"
+# smtp_from = "DataTask <datatask@exemplo.com>"
+# smtp_to = "ops@exemplo.com,admin@exemplo.com"
+smtp_security = "starttls"
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -96,7 +105,10 @@ No `install`, caminhos relativos de backup são ancorados em `/var/lib/datatask`
 destino (`0` desativa). `backup_alert_url` recebe um POST quando a verificação
 falha ou não há backups remotos. `backup_health_report_url` recebe o relatório
 periódico de saúde; `backup_health_report_interval_seconds` define a frequência
-(`0` desativa).
+(`0` desativa). `backup_health_report_email = true` envia também por SMTP,
+usando `smtp_host`, `smtp_from`, `smtp_to` (lista separada por vírgulas),
+`smtp_password_file` (`600`). `smtp_security` aceita `starttls`, `tls` ou
+`none` (este último apenas para relay local/confiável).
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -614,9 +626,14 @@ uma linha de resumo quando ainda não há histórico).
 
 Com `backup_health_report_url`, o scheduler envia o mesmo documento JSON a cada
 `backup_health_report_interval_seconds`; o botão **Enviar** e o endpoint
-`POST /api/backups/health/report` disparam na hora. Para e-mail, use um gateway
-que aceite webhook (ou encaminhe o payload). Entregas são auditadas como
+`POST /api/backups/health/report` disparam na hora. A entrega é auditada como
 `backup.report`.
+
+Para envio direto por e-mail, configure `smtp_host`, `smtp_from`, `smtp_to`,
+`smtp_security` e, se o servidor exigir autenticação, `smtp_username` +
+`smtp_password_file` (`600`), e ative `backup_health_report_email = true`. O
+relatório JSON é enviado como corpo texto do e-mail; TLS é usado por padrão
+(`starttls`). Use `smtp_security = "none"` somente em relay local confiável.
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:

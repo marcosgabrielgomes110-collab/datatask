@@ -8,6 +8,10 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Timelike};
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox,
+    transport::smtp::authentication::Credentials,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -127,6 +131,25 @@ struct Config {
     /// `0` disables periodic health report delivery.
     #[serde(default = "default_backup_health_report_interval_seconds")]
     backup_health_report_interval_seconds: u64,
+    /// Send the periodic health report by SMTP as well.
+    #[serde(default)]
+    backup_health_report_email: bool,
+    #[serde(default)]
+    smtp_host: Option<String>,
+    #[serde(default = "default_smtp_port")]
+    smtp_port: u16,
+    #[serde(default)]
+    smtp_username: Option<String>,
+    #[serde(default)]
+    smtp_password_file: Option<PathBuf>,
+    #[serde(default)]
+    smtp_from: Option<String>,
+    /// Comma-separated recipient list.
+    #[serde(default)]
+    smtp_to: Option<String>,
+    /// `starttls` (default), `tls` or `none`.
+    #[serde(default = "default_smtp_security")]
+    smtp_security: String,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -183,6 +206,14 @@ fn default_backup_verify_interval_seconds() -> u64 {
 
 fn default_backup_health_report_interval_seconds() -> u64 {
     86_400
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_smtp_security() -> String {
+    "starttls".to_owned()
 }
 
 fn default_job_version() -> u64 {
@@ -1882,7 +1913,8 @@ fn backup_health_snapshot(state: &AppState) -> ApiResult<Value> {
         "remote": remote,
         "encryption": state.config.backup_encryption_key_file.is_some(),
         "alerts_enabled": state.config.backup_alert_url.is_some(),
-        "report_enabled": state.config.backup_health_report_url.is_some(),
+        "report_enabled": state.config.backup_health_report_url.is_some()
+            || state.config.backup_health_report_email,
         "report_interval_seconds": state.config.backup_health_report_interval_seconds,
         "retention": state.config.backup_retention,
         "verify_interval_seconds": state.config.backup_verify_interval_seconds,
@@ -2054,44 +2086,123 @@ fn backup_health_document(state: &AppState) -> ApiResult<Value> {
     }))
 }
 
-async fn send_health_report(state: &AppState) -> Result<(), String> {
-    let url = state
+async fn send_health_email(state: &AppState, document: &Value) -> Result<(), String> {
+    let host = state
         .config
-        .backup_health_report_url
+        .smtp_host
         .as_deref()
-        .ok_or_else(|| "backup_health_report_url is not configured.".to_owned())?;
+        .ok_or_else(|| "smtp_host is not configured.".to_owned())?;
+    let from = state
+        .config
+        .smtp_from
+        .as_deref()
+        .ok_or_else(|| "smtp_from is not configured.".to_owned())?
+        .parse::<Mailbox>()
+        .map_err(|error| format!("Invalid smtp_from: {error}"))?;
+    let recipients: Vec<Mailbox> = state
+        .config
+        .smtp_to
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<Mailbox>()
+                .map_err(|error| format!("Invalid smtp_to '{value}': {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if recipients.is_empty() {
+        return Err("smtp_to has no recipients.".to_owned());
+    }
+
+    let mut builder = match state.config.smtp_security.as_str() {
+        "tls" => AsyncSmtpTransport::<Tokio1Executor>::relay(host),
+        "none" => Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(
+            host,
+        )),
+        _ => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host),
+    }
+    .map_err(|error| format!("Cannot configure SMTP transport: {error}"))?
+    .port(state.config.smtp_port);
+
+    if let (Some(username), Some(password_file)) = (
+        state.config.smtp_username.as_deref(),
+        state.config.smtp_password_file.as_deref(),
+    ) {
+        let password = fs::read_to_string(password_file)
+            .map_err(|error| format!("Cannot read SMTP password: {error}"))?
+            .trim()
+            .to_owned();
+        builder = builder.credentials(Credentials::new(username.to_owned(), password));
+    }
+    let transport = builder.build();
+    let status = document["health"]["status"].as_str().unwrap_or("unknown");
+    let mut message = Message::builder()
+        .from(from)
+        .subject(format!("[DataTask] Backup health: {status}"));
+    for recipient in recipients {
+        message = message.to(recipient);
+    }
+    let body = serde_json::to_string_pretty(document)
+        .map_err(|error| format!("Cannot serialize SMTP report: {error}"))?;
+    let email = message
+        .body(body)
+        .map_err(|error| format!("Cannot build SMTP message: {error}"))?;
+    let timeout = Duration::from_secs(state.config.notification_timeout_seconds);
+    match time::timeout(timeout, transport.send(email)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!("SMTP delivery failed: {error}")),
+        Err(_) => Err("SMTP delivery timed out.".to_owned()),
+    }
+}
+
+async fn send_health_report(state: &AppState) -> Result<(), String> {
+    let webhook = state.config.backup_health_report_url.as_deref();
+    let email = state.config.backup_health_report_email;
+    if webhook.is_none() && !email {
+        return Err("No health report channel is configured.".to_owned());
+    }
     let document = backup_health_document(state).map_err(|error| error.1)?;
-    match state.http_client.post(url).json(&document).send().await {
-        Ok(response) => {
-            let status = response.status();
-            state.record_backup_event(
-                BackupEventKind::Report,
-                status.is_success(),
-                Some(format!("HTTP {}", status.as_u16())),
-            );
-            state.audit(json!({
-                "ts": Local::now().to_rfc3339(),
-                "event": "backup.report",
-                "status": status.as_u16(),
-            }));
-            if !status.is_success() {
-                return Err(format!(
-                    "Health report webhook returned HTTP {}",
-                    status.as_u16()
-                ));
-            }
-            Ok(())
-        }
-        Err(error) => {
-            state.record_backup_event(BackupEventKind::Report, false, Some(error.to_string()));
-            state.audit(json!({
-                "ts": Local::now().to_rfc3339(),
-                "event": "backup.report",
-                "error": error.to_string(),
-            }));
-            Err(error.to_string())
+    let mut delivered = 0usize;
+    let mut errors = Vec::new();
+
+    if let Some(url) = webhook {
+        match state.http_client.post(url).json(&document).send().await {
+            Ok(response) if response.status().is_success() => delivered += 1,
+            Ok(response) => errors.push(format!(
+                "webhook returned HTTP {}",
+                response.status().as_u16()
+            )),
+            Err(error) => errors.push(format!("webhook: {error}")),
         }
     }
+    if email {
+        match send_health_email(state, &document).await {
+            Ok(()) => delivered += 1,
+            Err(error) => errors.push(error),
+        }
+    }
+
+    let ok = delivered > 0;
+    state.record_backup_event(
+        BackupEventKind::Report,
+        ok,
+        Some(if errors.is_empty() {
+            format!("{delivered} canal(is)")
+        } else {
+            format!("{delivered} canal(is); {}", errors.join("; "))
+        }),
+    );
+    state.audit(json!({
+        "ts": Local::now().to_rfc3339(),
+        "event": "backup.report",
+        "ok": ok,
+        "delivered": delivered,
+        "errors": errors,
+    }));
+    if ok { Ok(()) } else { Err(errors.join("; ")) }
 }
 
 async fn run_health_report(state: Arc<AppState>) {
@@ -2101,10 +2212,10 @@ async fn run_health_report(state: Arc<AppState>) {
 }
 
 async fn send_health_report_endpoint(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
-    if state.config.backup_health_report_url.is_none() {
+    if state.config.backup_health_report_url.is_none() && !state.config.backup_health_report_email {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            "backup_health_report_url is not configured.",
+            "No health report channel is configured.",
         ));
     }
     send_health_report(&state)
@@ -2737,6 +2848,76 @@ fn has_private_permissions(metadata: &fs::Metadata) -> bool {
     metadata.permissions().mode() & 0o077 == 0
 }
 
+fn validate_smtp_config(config: &Config) -> Result<(), String> {
+    let smtp_configured = config.smtp_host.is_some()
+        || config.smtp_from.is_some()
+        || config.smtp_to.is_some()
+        || config.smtp_username.is_some()
+        || config.smtp_password_file.is_some();
+    if !smtp_configured {
+        if config.backup_health_report_email {
+            return Err(
+                "backup_health_report_email requires smtp_host, smtp_from and smtp_to.".to_owned(),
+            );
+        }
+        return Ok(());
+    }
+    let host = config
+        .smtp_host
+        .as_deref()
+        .ok_or_else(|| "smtp_host is required for SMTP.".to_owned())?;
+    if host.is_empty() {
+        return Err("smtp_host cannot be empty.".to_owned());
+    }
+    let from = config
+        .smtp_from
+        .as_deref()
+        .ok_or_else(|| "smtp_from is required for SMTP.".to_owned())?;
+    from.parse::<lettre::message::Mailbox>()
+        .map_err(|error| format!("Invalid smtp_from: {error}"))?;
+    let to = config
+        .smtp_to
+        .as_deref()
+        .ok_or_else(|| "smtp_to is required for SMTP.".to_owned())?;
+    let recipients: Vec<&str> = to
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if recipients.is_empty() {
+        return Err("smtp_to must contain at least one recipient.".to_owned());
+    }
+    for recipient in recipients {
+        recipient
+            .parse::<lettre::message::Mailbox>()
+            .map_err(|error| format!("Invalid smtp_to recipient '{recipient}': {error}"))?;
+    }
+    if !matches!(config.smtp_security.as_str(), "starttls" | "tls" | "none") {
+        return Err("smtp_security must be starttls, tls or none.".to_owned());
+    }
+    if config.smtp_port == 0 {
+        return Err("smtp_port must be greater than zero.".to_owned());
+    }
+    match (&config.smtp_username, &config.smtp_password_file) {
+        (Some(_), Some(path)) => {
+            let metadata = fs::metadata(path).map_err(|error| {
+                format!("Cannot read SMTP password file {}: {error}", path.display())
+            })?;
+            if !has_private_permissions(&metadata) {
+                return Err(format!(
+                    "SMTP password file {} must not be accessible by group or others (chmod 600).",
+                    path.display()
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err("Set both smtp_username and smtp_password_file, or neither.".to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("Cannot read config {}: {error}", path.display()))?;
@@ -2820,6 +3001,34 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     if let Some(url) = &config.backup_health_report_url {
         normalize_notify_url(Some(url)).map_err(|error| error.1)?;
     }
+    config.smtp_host = config
+        .smtp_host
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    config.smtp_username = config
+        .smtp_username
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    config.smtp_from = config
+        .smtp_from
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    config.smtp_to = config
+        .smtp_to
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    config.smtp_password_file = match config.smtp_password_file.take() {
+        None => None,
+        Some(path) if path.as_os_str().is_empty() => None,
+        Some(path) if path.is_relative() => Some(base.join(path)),
+        Some(path) => Some(path),
+    };
+    config.smtp_security = config.smtp_security.trim().to_ascii_lowercase();
+    validate_smtp_config(&config)?;
     for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
         if let Some(path) = path
             && path.is_relative()
@@ -4767,7 +4976,8 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "backup_encryption": state.config.backup_encryption_key_file.is_some(),
         "backup_verify_interval_seconds": state.config.backup_verify_interval_seconds,
         "backup_alert_enabled": state.config.backup_alert_url.is_some(),
-        "backup_health_report_enabled": state.config.backup_health_report_url.is_some(),
+        "backup_health_report_enabled": state.config.backup_health_report_url.is_some()
+            || state.config.backup_health_report_email,
         "backup_health_report_interval_seconds": state.config
             .backup_health_report_interval_seconds,
         "backup_last_verify": last_backup_verify,
@@ -4904,7 +5114,8 @@ async fn scheduler(state: Arc<AppState>) {
                 });
             }
         }
-        if state.config.backup_health_report_url.is_some()
+        if (state.config.backup_health_report_url.is_some()
+            || state.config.backup_health_report_email)
             && state.config.backup_health_report_interval_seconds > 0
         {
             let due = last_report.is_none_or(|last| {

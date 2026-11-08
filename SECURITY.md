@@ -55,6 +55,9 @@ advisory com crédito, se desejado.
 - `backup_alert_url` tem o mesmo risco de SSRF do webhook de jobs; use somente
   destinos confiáveis e proteja o token. `backup_health_report_url` segue a
   mesma regra e recebe o relatório periódico.
+- Credenciais SMTP ficam em `smtp_password_file` (`600`) e são usadas pelo
+  usuário do serviço; prefira `starttls`/`tls` e nunca use `none` fora de um
+  relay local confiável.
 - A exportação inclui `action` e `notify_url` dos jobs, que podem conter
   segredos. Trate o JSON exportado como credencial (`600`) e não o publique.
   A importação pode sobrescrever jobs existentes; revise a prévia antes.

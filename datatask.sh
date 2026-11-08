@@ -404,6 +404,14 @@ backup_verify_interval_seconds = 86400
 backup_alert_url = ""
 backup_health_report_url = ""
 backup_health_report_interval_seconds = 86400
+backup_health_report_email = false
+smtp_host = ""
+smtp_port = 587
+smtp_username = ""
+smtp_password_file = ""
+smtp_from = ""
+smtp_to = ""
+smtp_security = "starttls"
 EOF
   umask "$old_umask"
 }
@@ -601,6 +609,11 @@ cmd_setup() {
   local prev_backup_alert prev_backup_alert_set=0
   local prev_backup_report prev_backup_report_set=0
   local prev_backup_report_interval prev_backup_report_interval_set=0
+  local prev_backup_email prev_backup_email_set=0
+  local prev_smtp_host prev_smtp_host_set=0 prev_smtp_port prev_smtp_port_set=0
+  local prev_smtp_user prev_smtp_user_set=0 prev_smtp_pass prev_smtp_pass_set=0
+  local prev_smtp_from prev_smtp_from_set=0 prev_smtp_to prev_smtp_to_set=0
+  local prev_smtp_security prev_smtp_security_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -686,6 +699,38 @@ cmd_setup() {
     prev_backup_report_interval="$(config_get "$conf" backup_health_report_interval_seconds)"
     prev_backup_report_interval_set=1
   fi
+  if grep -qE '^[[:space:]]*backup_health_report_email[[:space:]]*=' "$conf"; then
+    prev_backup_email="$(config_get "$conf" backup_health_report_email)"
+    prev_backup_email_set=1
+  fi
+  if grep -qE '^[[:space:]]*smtp_host[[:space:]]*=' "$conf"; then
+    prev_smtp_host="$(config_get "$conf" smtp_host)"
+    prev_smtp_host_set=1
+  fi
+  if grep -qE '^[[:space:]]*smtp_port[[:space:]]*=' "$conf"; then
+    prev_smtp_port="$(config_get "$conf" smtp_port)"
+    prev_smtp_port_set=1
+  fi
+  if grep -qE '^[[:space:]]*smtp_username[[:space:]]*=' "$conf"; then
+    prev_smtp_user="$(config_get "$conf" smtp_username)"
+    prev_smtp_user_set=1
+  fi
+  if grep -qE '^[[:space:]]*smtp_password_file[[:space:]]*=' "$conf"; then
+    prev_smtp_pass="$(config_get "$conf" smtp_password_file)"
+    prev_smtp_pass_set=1
+  fi
+  if grep -qE '^[[:space:]]*smtp_from[[:space:]]*=' "$conf"; then
+    prev_smtp_from="$(config_get "$conf" smtp_from)"
+    prev_smtp_from_set=1
+  fi
+  if grep -qE '^[[:space:]]*smtp_to[[:space:]]*=' "$conf"; then
+    prev_smtp_to="$(config_get "$conf" smtp_to)"
+    prev_smtp_to_set=1
+  fi
+  if grep -qE '^[[:space:]]*smtp_security[[:space:]]*=' "$conf"; then
+    prev_smtp_security="$(config_get "$conf" smtp_security)"
+    prev_smtp_security_set=1
+  fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
   cur_port="${cur_port:-$DEFAULT_PORT}"
@@ -765,6 +810,14 @@ cmd_setup() {
   [[ "$prev_backup_alert_set" -eq 1 ]] && config_set_string "$conf" backup_alert_url "$prev_backup_alert"
   [[ "$prev_backup_report_set" -eq 1 ]] && config_set_string "$conf" backup_health_report_url "$prev_backup_report"
   [[ "$prev_backup_report_interval_set" -eq 1 ]] && config_set_raw "$conf" backup_health_report_interval_seconds "$prev_backup_report_interval"
+  [[ "$prev_backup_email_set" -eq 1 ]] && config_set_raw "$conf" backup_health_report_email "$prev_backup_email"
+  [[ "$prev_smtp_host_set" -eq 1 ]] && config_set_string "$conf" smtp_host "$prev_smtp_host"
+  [[ "$prev_smtp_port_set" -eq 1 ]] && config_set_raw "$conf" smtp_port "$prev_smtp_port"
+  [[ "$prev_smtp_user_set" -eq 1 ]] && config_set_string "$conf" smtp_username "$prev_smtp_user"
+  [[ "$prev_smtp_pass_set" -eq 1 ]] && config_set_string "$conf" smtp_password_file "$prev_smtp_pass"
+  [[ "$prev_smtp_from_set" -eq 1 ]] && config_set_string "$conf" smtp_from "$prev_smtp_from"
+  [[ "$prev_smtp_to_set" -eq 1 ]] && config_set_string "$conf" smtp_to "$prev_smtp_to"
+  [[ "$prev_smtp_security_set" -eq 1 ]] && config_set_string "$conf" smtp_security "$prev_smtp_security"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then
@@ -1142,6 +1195,10 @@ prepare_service_files() {
   local backup_key; backup_key="$(config_get "$CONF_FILE" backup_encryption_key_file)"
   if [[ -n "$backup_key" && "$backup_key" != /* ]]; then
     config_set_string "$CONF_FILE" backup_encryption_key_file "${cert_base}/${backup_key}"
+  fi
+  local smtp_pass; smtp_pass="$(config_get "$CONF_FILE" smtp_password_file)"
+  if [[ -n "$smtp_pass" && "$smtp_pass" != /* ]]; then
+    config_set_string "$CONF_FILE" smtp_password_file "${cert_base}/${smtp_pass}"
   fi
 
   # Se a config veio de outro lugar com caminhos relativos, ancora em DATA_DIR.
