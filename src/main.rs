@@ -9,7 +9,8 @@ use axum::{
 };
 use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Timelike};
 use lettre::{
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox,
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    message::{Attachment, Mailbox, MultiPart, SinglePart, header::ContentType},
     transport::smtp::authentication::Credentials,
 };
 use serde::{Deserialize, Serialize};
@@ -150,6 +151,9 @@ struct Config {
     /// `starttls` (default), `tls` or `none`.
     #[serde(default = "default_smtp_security")]
     smtp_security: String,
+    /// Optional e-mail subject; the status is appended when omitted.
+    #[serde(default)]
+    smtp_subject: Option<String>,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -2139,16 +2143,67 @@ async fn send_health_email(state: &AppState, document: &Value) -> Result<(), Str
     }
     let transport = builder.build();
     let status = document["health"]["status"].as_str().unwrap_or("unknown");
-    let mut message = Message::builder()
-        .from(from)
-        .subject(format!("[DataTask] Backup health: {status}"));
+    let subject = state
+        .config
+        .smtp_subject
+        .clone()
+        .unwrap_or_else(|| format!("[DataTask] Backup health: {status}"));
+    let mut message = Message::builder().from(from).subject(subject);
     for recipient in recipients {
         message = message.to(recipient);
     }
-    let body = serde_json::to_string_pretty(document)
+
+    let health = &document["health"];
+    let problems = health["problems"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    let checked = health["last_verify"]["checked"].as_u64().unwrap_or(0);
+    let ok = health["last_verify"]["ok"].as_u64().unwrap_or(0);
+    let failed = health["last_verify"]["failed"].as_u64().unwrap_or(0);
+    let summary = format!(
+        "DataTask backup health: {status}\n\
+         local backups: {}\n\
+         remote: {}\n\
+         last verification: {ok}/{checked} OK, {failed} failed\n\
+         problems: {}\n\n\
+         Full JSON and CSV reports are attached.\n",
+        health["local_count"].as_u64().unwrap_or(0),
+        health["remote"].as_str().unwrap_or("disabled"),
+        if problems.is_empty() {
+            "none"
+        } else {
+            &problems
+        },
+    );
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    let json_body = serde_json::to_string_pretty(document)
         .map_err(|error| format!("Cannot serialize SMTP report: {error}"))?;
+    let verifications: Vec<BackupVerifySummary> =
+        serde_json::from_value(document["verifications"].clone()).unwrap_or_default();
+    let csv_body = health_csv(health, &verifications);
+    let multipart = MultiPart::mixed()
+        .singlepart(SinglePart::plain(summary))
+        .singlepart(
+            Attachment::new(format!("datatask-backup-health-{timestamp}.json")).body(
+                json_body,
+                ContentType::parse("application/json").expect("valid content type"),
+            ),
+        )
+        .singlepart(
+            Attachment::new(format!("datatask-backup-health-{timestamp}.csv")).body(
+                csv_body,
+                ContentType::parse("text/csv").expect("valid content type"),
+            ),
+        );
     let email = message
-        .body(body)
+        .multipart(multipart)
         .map_err(|error| format!("Cannot build SMTP message: {error}"))?;
     let timeout = Duration::from_secs(state.config.notification_timeout_seconds);
     match time::timeout(timeout, transport.send(email)).await {
@@ -3028,6 +3083,11 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         Some(path) => Some(path),
     };
     config.smtp_security = config.smtp_security.trim().to_ascii_lowercase();
+    config.smtp_subject = config
+        .smtp_subject
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     validate_smtp_config(&config)?;
     for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
         if let Some(path) = path

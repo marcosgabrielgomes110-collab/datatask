@@ -412,6 +412,7 @@ smtp_password_file = ""
 smtp_from = ""
 smtp_to = ""
 smtp_security = "starttls"
+smtp_subject = ""
 EOF
   umask "$old_umask"
 }
@@ -614,6 +615,7 @@ cmd_setup() {
   local prev_smtp_user prev_smtp_user_set=0 prev_smtp_pass prev_smtp_pass_set=0
   local prev_smtp_from prev_smtp_from_set=0 prev_smtp_to prev_smtp_to_set=0
   local prev_smtp_security prev_smtp_security_set=0
+  local prev_smtp_subject prev_smtp_subject_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -731,6 +733,10 @@ cmd_setup() {
     prev_smtp_security="$(config_get "$conf" smtp_security)"
     prev_smtp_security_set=1
   fi
+  if grep -qE '^[[:space:]]*smtp_subject[[:space:]]*=' "$conf"; then
+    prev_smtp_subject="$(config_get "$conf" smtp_subject)"
+    prev_smtp_subject_set=1
+  fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
   cur_port="${cur_port:-$DEFAULT_PORT}"
@@ -818,6 +824,7 @@ cmd_setup() {
   [[ "$prev_smtp_from_set" -eq 1 ]] && config_set_string "$conf" smtp_from "$prev_smtp_from"
   [[ "$prev_smtp_to_set" -eq 1 ]] && config_set_string "$conf" smtp_to "$prev_smtp_to"
   [[ "$prev_smtp_security_set" -eq 1 ]] && config_set_string "$conf" smtp_security "$prev_smtp_security"
+  [[ "$prev_smtp_subject_set" -eq 1 ]] && config_set_string "$conf" smtp_subject "$prev_smtp_subject"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then

@@ -58,6 +58,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   (`backup_health_report_url`), com disparo manual e auditoria de entrega.
 - Envio direto por SMTP (`backup_health_report_email`, `smtp_*`) com TLS,
   credenciais opcionais e múltiplos destinatários.
+- E-mails de saúde com corpo resumido e anexos JSON/CSV, assunto configurável
+  por `smtp_subject` e remetente por `smtp_from`.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

@@ -59,6 +59,7 @@ backup_health_report_email = false
 # smtp_password_file = "/etc/datatask/smtp.pass"
 # smtp_from = "DataTask <datatask@exemplo.com>"
 # smtp_to = "ops@exemplo.com,admin@exemplo.com"
+# smtp_subject = "[DataTask] relatório de backup"
 smtp_security = "starttls"
 ```
 
@@ -108,7 +109,8 @@ periódico de saúde; `backup_health_report_interval_seconds` define a frequênc
 (`0` desativa). `backup_health_report_email = true` envia também por SMTP,
 usando `smtp_host`, `smtp_from`, `smtp_to` (lista separada por vírgulas),
 `smtp_password_file` (`600`). `smtp_security` aceita `starttls`, `tls` ou
-`none` (este último apenas para relay local/confiável).
+`none` (este último apenas para relay local/confiável). `smtp_subject`
+personaliza o assunto; `smtp_from` define o remetente.
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -633,7 +635,9 @@ Para envio direto por e-mail, configure `smtp_host`, `smtp_from`, `smtp_to`,
 `smtp_security` e, se o servidor exigir autenticação, `smtp_username` +
 `smtp_password_file` (`600`), e ative `backup_health_report_email = true`. O
 relatório JSON é enviado como corpo texto do e-mail; TLS é usado por padrão
-(`starttls`). Use `smtp_security = "none"` somente em relay local confiável.
+(`starttls`). Use `smtp_security = "none"` somente em relay local confiável. O
+e-mail traz um resumo no corpo e anexos JSON/CSV; `smtp_from` define o
+remetente e `smtp_subject` o assunto.
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:
