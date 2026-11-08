@@ -121,6 +121,12 @@ struct Config {
     /// Optional webhook called when remote verification fails or has no backups.
     #[serde(default)]
     backup_alert_url: Option<String>,
+    /// Optional webhook that receives the periodic backup health report.
+    #[serde(default)]
+    backup_health_report_url: Option<String>,
+    /// `0` disables periodic health report delivery.
+    #[serde(default = "default_backup_health_report_interval_seconds")]
+    backup_health_report_interval_seconds: u64,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -172,6 +178,10 @@ fn default_backup_remote_timeout_seconds() -> u64 {
 }
 
 fn default_backup_verify_interval_seconds() -> u64 {
+    86_400
+}
+
+fn default_backup_health_report_interval_seconds() -> u64 {
     86_400
 }
 
@@ -241,6 +251,7 @@ impl AppState {
             BackupEventKind::Upload => health.last_upload = Some(event),
             BackupEventKind::Prune => health.last_prune = Some(event),
             BackupEventKind::Alert => health.last_alert = Some(event),
+            BackupEventKind::Report => health.last_report = Some(event),
         }
     }
 }
@@ -1645,6 +1656,7 @@ enum BackupEventKind {
     Upload,
     Prune,
     Alert,
+    Report,
 }
 
 #[derive(Clone, Serialize)]
@@ -1659,6 +1671,7 @@ struct BackupHealth {
     last_upload: Option<BackupEvent>,
     last_prune: Option<BackupEvent>,
     last_alert: Option<BackupEvent>,
+    last_report: Option<BackupEvent>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1869,6 +1882,8 @@ fn backup_health_snapshot(state: &AppState) -> ApiResult<Value> {
         "remote": remote,
         "encryption": state.config.backup_encryption_key_file.is_some(),
         "alerts_enabled": state.config.backup_alert_url.is_some(),
+        "report_enabled": state.config.backup_health_report_url.is_some(),
+        "report_interval_seconds": state.config.backup_health_report_interval_seconds,
         "retention": state.config.backup_retention,
         "verify_interval_seconds": state.config.backup_verify_interval_seconds,
         "local_count": local.len(),
@@ -1876,6 +1891,7 @@ fn backup_health_snapshot(state: &AppState) -> ApiResult<Value> {
         "last_upload": health.last_upload,
         "last_prune": health.last_prune,
         "last_alert": health.last_alert,
+        "last_report": health.last_report,
         "last_verify": last_verify,
         "problems": problems,
         "now": Local::now().to_rfc3339(),
@@ -2022,6 +2038,79 @@ async fn export_backup_health(
             "format must be json or csv.",
         )),
     }
+}
+
+fn backup_health_document(state: &AppState) -> ApiResult<Value> {
+    let health = backup_health_snapshot(state)?;
+    let mut verifications = state.verify_history.read();
+    verifications.reverse();
+    verifications.truncate(1000);
+    Ok(json!({
+        "format": "datatask.backup-health",
+        "version": 1,
+        "generated_at": health["now"],
+        "health": health,
+        "verifications": verifications,
+    }))
+}
+
+async fn send_health_report(state: &AppState) -> Result<(), String> {
+    let url = state
+        .config
+        .backup_health_report_url
+        .as_deref()
+        .ok_or_else(|| "backup_health_report_url is not configured.".to_owned())?;
+    let document = backup_health_document(state).map_err(|error| error.1)?;
+    match state.http_client.post(url).json(&document).send().await {
+        Ok(response) => {
+            let status = response.status();
+            state.record_backup_event(
+                BackupEventKind::Report,
+                status.is_success(),
+                Some(format!("HTTP {}", status.as_u16())),
+            );
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.report",
+                "status": status.as_u16(),
+            }));
+            if !status.is_success() {
+                return Err(format!(
+                    "Health report webhook returned HTTP {}",
+                    status.as_u16()
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state.record_backup_event(BackupEventKind::Report, false, Some(error.to_string()));
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.report",
+                "error": error.to_string(),
+            }));
+            Err(error.to_string())
+        }
+    }
+}
+
+async fn run_health_report(state: Arc<AppState>) {
+    if let Err(error) = send_health_report(&state).await {
+        eprintln!("Backup health report delivery failed: {error}");
+    }
+}
+
+async fn send_health_report_endpoint(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    if state.config.backup_health_report_url.is_none() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "backup_health_report_url is not configured.",
+        ));
+    }
+    send_health_report(&state)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn get_backups(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
@@ -2721,6 +2810,14 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         .map(|url| url.trim().to_owned())
         .filter(|url| !url.is_empty());
     if let Some(url) = &config.backup_alert_url {
+        normalize_notify_url(Some(url)).map_err(|error| error.1)?;
+    }
+    config.backup_health_report_url = config
+        .backup_health_report_url
+        .take()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty());
+    if let Some(url) = &config.backup_health_report_url {
         normalize_notify_url(Some(url)).map_err(|error| error.1)?;
     }
     for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
@@ -4670,6 +4767,9 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "backup_encryption": state.config.backup_encryption_key_file.is_some(),
         "backup_verify_interval_seconds": state.config.backup_verify_interval_seconds,
         "backup_alert_enabled": state.config.backup_alert_url.is_some(),
+        "backup_health_report_enabled": state.config.backup_health_report_url.is_some(),
+        "backup_health_report_interval_seconds": state.config
+            .backup_health_report_interval_seconds,
         "backup_last_verify": last_backup_verify,
         "active_count": active_count,
         "recurring_count": recurring_count,
@@ -4707,6 +4807,7 @@ async fn scheduler(state: Arc<AppState>) {
     let mut ticker = time::interval(interval);
     let mut last_backup: Option<Instant> = None;
     let mut last_verify: Option<Instant> = None;
+    let mut last_report: Option<Instant> = None;
     loop {
         ticker.tick().await;
         *state
@@ -4799,6 +4900,24 @@ async fn scheduler(state: Arc<AppState>) {
                     let lock = verify_state.backup_lock.clone();
                     if let Ok(_guard) = lock.try_lock() {
                         run_remote_verify(verify_state).await;
+                    }
+                });
+            }
+        }
+        if state.config.backup_health_report_url.is_some()
+            && state.config.backup_health_report_interval_seconds > 0
+        {
+            let due = last_report.is_none_or(|last| {
+                last.elapsed()
+                    >= Duration::from_secs(state.config.backup_health_report_interval_seconds)
+            });
+            if due {
+                last_report = Some(Instant::now());
+                let report_state = state.clone();
+                tokio::spawn(async move {
+                    let lock = report_state.backup_lock.clone();
+                    if let Ok(_guard) = lock.try_lock() {
+                        run_health_report(report_state).await;
                     }
                 });
             }
@@ -5029,6 +5148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/backups", get(get_backups))
         .route("/api/backups/health", get(get_backup_health))
         .route("/api/backups/health/export", get(export_backup_health))
+        .route(
+            "/api/backups/health/report",
+            post(send_health_report_endpoint),
+        )
         .route("/api/backups/verifications", get(get_backup_verifications))
         .route("/api/backups/verify", post(verify_backups))
         .route("/api/backups/{name}", get(get_backup_file))

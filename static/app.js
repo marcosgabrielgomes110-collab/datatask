@@ -99,6 +99,7 @@
     backupsVerify: $("#backupsVerify"),
     backupsExportJson: $("#backupsExportJson"),
     backupsExportCsv: $("#backupsExportCsv"),
+    backupsSendReport: $("#backupsSendReport"),
     backupHealthStatus: $("#backupHealthStatus"),
     backupHealthTitle: $("#backupHealthTitle"),
     backupHealthDetails: $("#backupHealthDetails"),
@@ -734,6 +735,9 @@
         ? `${info.backup_last_verify.ok}/${info.backup_last_verify.checked} OK · ${formatHistoryTime(info.backup_last_verify.timestamp)}`
         : "nunca"],
       ["Alertas de backup", info.backup_alert_enabled ? "ativos" : "desativados"],
+      ["Relatório de saúde", info.backup_health_report_enabled
+        ? `a cada ${info.backup_health_report_interval_seconds}s`
+        : "desativado"],
       ["Tarefas cadastradas", String(info.job_count)],
       ["Tarefas ativas", String(info.active_count)],
       ["Executando agora", running ? `${running} (${info.running.join(", ")})` : "nenhuma"],
@@ -1441,7 +1445,8 @@
       `remoto: ${data.remote || "desativado"}`,
       `retenção: ${data.retention ?? "—"}`,
       `último upload: ${data.last_upload ? formatHistoryTime(data.last_upload.timestamp) : "—"}`,
-      `última verificação: ${data.last_verify ? formatHistoryTime(data.last_verify.timestamp) : "—"}`
+      `última verificação: ${data.last_verify ? formatHistoryTime(data.last_verify.timestamp) : "—"}`,
+      `último relatório: ${data.last_report ? formatHistoryTime(data.last_report.timestamp) : "—"}`
     ];
     const problems = Array.isArray(data.problems) && data.problems.length
       ? ` Problemas: ${data.problems.join("; ")}.`
@@ -2103,6 +2108,19 @@
     });
     el.backupsExportCsv.addEventListener("click", () => {
       exportBackupHealth("csv").catch(error => toast(error.message, "error"));
+    });
+    el.backupsSendReport.addEventListener("click", async () => {
+      if (!getToken()) {
+        toast("Conecte-se à API para enviar.", "error");
+        return;
+      }
+      try {
+        await api("/api/backups/health/report", { method: "POST" });
+        toast("Relatório de saúde enviado.", "success");
+        await loadBackupHealth();
+      } catch (error) {
+        toast(error.message, "error");
+      }
     });
     el.backupsVerify.addEventListener("click", async () => {
       if (!getToken()) {

@@ -48,6 +48,9 @@ backup_remote_timeout_seconds = 60
 backup_verify_interval_seconds = 86400
 # backup_alert_url = "https://exemplo.com/datatask-alert"
 backup_alert_url = ""
+# backup_health_report_url = "https://exemplo.com/datatask-report"
+backup_health_report_url = ""
+backup_health_report_interval_seconds = 86400
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -91,7 +94,9 @@ No `install`, caminhos relativos de backup são ancorados em `/var/lib/datatask`
 `backup_encryption_key_file`, o artefato remoto é cifrado com GPG.
 `backup_verify_interval_seconds` faz a verificação periódica dos checksums no
 destino (`0` desativa). `backup_alert_url` recebe um POST quando a verificação
-falha ou não há backups remotos.
+falha ou não há backups remotos. `backup_health_report_url` recebe o relatório
+periódico de saúde; `backup_health_report_interval_seconds` define a frequência
+(`0` desativa).
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -421,6 +426,8 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
   retenção, verificação e problemas)
 - `GET /api/backups/health/export?format=json|csv` — relatório para auditoria
   externa com resumo, eventos e histórico de verificações
+- `POST /api/backups/health/report` — envia o relatório agora para
+  `backup_health_report_url`
 - `POST /api/backups/verify` — baixa e verifica os checksums no destino remoto
 - `GET /api/backups/verifications?limit=&offset=` — histórico persistente das
   verificações, mais recentes primeiro
@@ -604,6 +611,12 @@ local/remoto, retenção, último upload, última verificação e a lista de
 problemas. Os botões **JSON** e **CSV** exportam esse resumo e o histórico de
 verificações para auditoria externa; o CSV traz uma linha por verificação (ou
 uma linha de resumo quando ainda não há histórico).
+
+Com `backup_health_report_url`, o scheduler envia o mesmo documento JSON a cada
+`backup_health_report_interval_seconds`; o botão **Enviar** e o endpoint
+`POST /api/backups/health/report` disparam na hora. Para e-mail, use um gateway
+que aceite webhook (ou encaminhe o payload). Entregas são auditadas como
+`backup.report`.
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:

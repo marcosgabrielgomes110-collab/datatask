@@ -54,6 +54,8 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   painel) com upload, retenção, verificação, alertas e problemas.
 - Exportação do relatório de saúde em JSON/CSV
   (`/api/backups/health/export`) com histórico de verificações e problemas.
+- Envio periódico do relatório de saúde por webhook
+  (`backup_health_report_url`), com disparo manual e auditoria de entrega.
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

@@ -402,6 +402,8 @@ backup_encryption_key_file = ""
 backup_remote_timeout_seconds = 60
 backup_verify_interval_seconds = 86400
 backup_alert_url = ""
+backup_health_report_url = ""
+backup_health_report_interval_seconds = 86400
 EOF
   umask "$old_umask"
 }
@@ -597,6 +599,8 @@ cmd_setup() {
   local prev_backup_timeout prev_backup_timeout_set=0
   local prev_backup_verify prev_backup_verify_set=0
   local prev_backup_alert prev_backup_alert_set=0
+  local prev_backup_report prev_backup_report_set=0
+  local prev_backup_report_interval prev_backup_report_interval_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -673,6 +677,14 @@ cmd_setup() {
   if grep -qE '^[[:space:]]*backup_alert_url[[:space:]]*=' "$conf"; then
     prev_backup_alert="$(config_get "$conf" backup_alert_url)"
     prev_backup_alert_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_health_report_url[[:space:]]*=' "$conf"; then
+    prev_backup_report="$(config_get "$conf" backup_health_report_url)"
+    prev_backup_report_set=1
+  fi
+  if grep -qE '^[[:space:]]*backup_health_report_interval_seconds[[:space:]]*=' "$conf"; then
+    prev_backup_report_interval="$(config_get "$conf" backup_health_report_interval_seconds)"
+    prev_backup_report_interval_set=1
   fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
@@ -751,6 +763,8 @@ cmd_setup() {
   [[ "$prev_backup_timeout_set" -eq 1 ]] && config_set_raw "$conf" backup_remote_timeout_seconds "$prev_backup_timeout"
   [[ "$prev_backup_verify_set" -eq 1 ]] && config_set_raw "$conf" backup_verify_interval_seconds "$prev_backup_verify"
   [[ "$prev_backup_alert_set" -eq 1 ]] && config_set_string "$conf" backup_alert_url "$prev_backup_alert"
+  [[ "$prev_backup_report_set" -eq 1 ]] && config_set_string "$conf" backup_health_report_url "$prev_backup_report"
+  [[ "$prev_backup_report_interval_set" -eq 1 ]] && config_set_raw "$conf" backup_health_report_interval_seconds "$prev_backup_report_interval"
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then
