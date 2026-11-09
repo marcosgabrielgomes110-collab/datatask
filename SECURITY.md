@@ -55,6 +55,8 @@ advisory com crédito, se desejado.
 - `backup_alert_url` tem o mesmo risco de SSRF do webhook de jobs; use somente
   destinos confiáveis e proteja o token. `backup_health_report_url` segue a
   mesma regra e recebe o relatório periódico.
+- URLs de `[[notification_profiles]]` são validadas como http/https, mas também
+  podem alcançar serviços internos; cadastre somente destinos confiáveis.
 - Credenciais SMTP ficam em `smtp_password_file` (`600`) e são usadas pelo
   usuário do serviço; prefira `starttls`/`tls` e nunca use `none` fora de um
   relay local confiável.

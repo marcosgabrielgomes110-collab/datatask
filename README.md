@@ -61,6 +61,16 @@ backup_health_report_email = false
 # smtp_to = "ops@exemplo.com,admin@exemplo.com"
 # smtp_subject = "[DataTask] relatório de backup"
 smtp_security = "starttls"
+
+# Perfis adicionais por destino, com filtro de severidade.
+# [[notification_profiles]]
+# name = "plantao"
+# channel = "webhook"        # webhook (padrão) ou email
+# url = "https://exemplo.com/datatask-oncall"
+# to = "oncall@exemplo.com" # e-mail (padrão: smtp_to)
+# subject = "[DataTask] plantão"
+# min_severity = "error"     # ok, warning (padrão) ou error
+# enabled = true
 ```
 
 Gere um token com `openssl rand -hex 32`. Use **apenas uma** das opções
@@ -111,6 +121,12 @@ usando `smtp_host`, `smtp_from`, `smtp_to` (lista separada por vírgulas),
 `smtp_password_file` (`600`). `smtp_security` aceita `starttls`, `tls` ou
 `none` (este último apenas para relay local/confiável). `smtp_subject`
 personaliza o assunto; `smtp_from` define o remetente.
+
+`[[notification_profiles]]` adiciona destinos extras de webhook ou e-mail com
+filtro de severidade (`min_severity = "ok"`, `"warning"` ou `"error"`), nome
+único e `enabled` (padrão `true`). Perfis de e-mail usam `to` (ou `smtp_to`) e
+`subject` (ou `smtp_subject`); perfis de webhook exigem `url`. A entrega de cada
+perfil é auditada como `backup.report_profile`.
 
 O servidor aplica `umask 077` e mantém `jobs/` e `logs/` em `700`, com arquivos
 `600`, porque ações e saídas de comandos podem conter segredos. A config também
@@ -441,7 +457,7 @@ e `/metrics` via loopback (acesso remoto a `/metrics` continua exigindo Bearer).
 - `GET /api/backups/health/export?format=json|csv` — relatório para auditoria
   externa com resumo, eventos e histórico de verificações
 - `POST /api/backups/health/report` — envia o relatório agora para
-  `backup_health_report_url`
+  `backup_health_report_url`, e-mail e perfis habilitados
 - `POST /api/backups/verify` — baixa e verifica os checksums no destino remoto
 - `GET /api/backups/verifications?limit=&offset=` — histórico persistente das
   verificações, mais recentes primeiro
@@ -638,6 +654,14 @@ relatório JSON é enviado como corpo texto do e-mail; TLS é usado por padrão
 (`starttls`). Use `smtp_security = "none"` somente em relay local confiável. O
 e-mail traz um resumo no corpo e anexos JSON/CSV; `smtp_from` define o
 remetente e `smtp_subject` o assunto.
+
+Além dos canais base, `[[notification_profiles]]` permite vários destinos
+independentes, cada um com `channel` (`webhook`/`email`), `min_severity`
+(`ok`/`warning`/`error`) e `enabled`. Perfis abaixo da severidade mínima são
+ignorados e registrados como `skipped` na auditoria; os demais entregam o mesmo
+documento JSON (e anexos, no caso de e-mail) e o resultado aparece em
+`backup.report_profile`. O resumo em `/api/backups/health` lista os perfis
+configurados.
 
 Para cifrar o artefato remoto (o backup local continua JSON), crie uma senha
 forte em arquivo `600` e configure:

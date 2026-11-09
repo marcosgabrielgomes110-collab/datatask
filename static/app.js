@@ -736,7 +736,7 @@
         : "nunca"],
       ["Alertas de backup", info.backup_alert_enabled ? "ativos" : "desativados"],
       ["Relatório de saúde", info.backup_health_report_enabled
-        ? `a cada ${info.backup_health_report_interval_seconds}s`
+        ? `a cada ${info.backup_health_report_interval_seconds}s${info.backup_health_report_profiles ? ` · ${info.backup_health_report_profiles} perfil(is)` : ""}`
         : "desativado"],
       ["Tarefas cadastradas", String(info.job_count)],
       ["Tarefas ativas", String(info.active_count)],
@@ -1446,7 +1446,10 @@
       `retenção: ${data.retention ?? "—"}`,
       `último upload: ${data.last_upload ? formatHistoryTime(data.last_upload.timestamp) : "—"}`,
       `última verificação: ${data.last_verify ? formatHistoryTime(data.last_verify.timestamp) : "—"}`,
-      `último relatório: ${data.last_report ? formatHistoryTime(data.last_report.timestamp) : "—"}`
+      `último relatório: ${data.last_report ? formatHistoryTime(data.last_report.timestamp) : "—"}`,
+      ...(Array.isArray(data.report_profiles) && data.report_profiles.length
+        ? [`perfis de notificação: ${data.report_profiles.filter(profile => profile.enabled).length}`]
+        : [])
     ];
     const problems = Array.isArray(data.problems) && data.problems.length
       ? ` Problemas: ${data.problems.join("; ")}.`

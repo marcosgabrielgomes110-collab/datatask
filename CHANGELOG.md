@@ -60,6 +60,9 @@ versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
   credenciais opcionais e múltiplos destinatários.
 - E-mails de saúde com corpo resumido e anexos JSON/CSV, assunto configurável
   por `smtp_subject` e remetente por `smtp_from`.
+- Perfis de notificação por destino (`[[notification_profiles]]`) para webhook
+  ou e-mail, com filtro de severidade (`ok`/`warning`/`error`), nome único,
+  `enabled` e auditoria por perfil (`backup.report_profile`).
 - Exigência de `tls_terminated_by_proxy` para bind fora de loopback, rejeição
   `426` sem `X-Forwarded-Proto: https` e HSTS quando atrás de proxy TLS.
 - Allowlist `trusted_proxy_ips` para aceitar `X-Forwarded-For`/`Proto` apenas de

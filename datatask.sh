@@ -413,6 +413,13 @@ smtp_from = ""
 smtp_to = ""
 smtp_security = "starttls"
 smtp_subject = ""
+# Perfis adicionais de notificação com filtro de severidade (ok, warning, error).
+# [[notification_profiles]]
+# name = "plantao"
+# channel = "webhook"
+# url = "https://exemplo.invalid/datatask"
+# min_severity = "error"
+# enabled = true
 EOF
   umask "$old_umask"
 }
@@ -616,6 +623,7 @@ cmd_setup() {
   local prev_smtp_from prev_smtp_from_set=0 prev_smtp_to prev_smtp_to_set=0
   local prev_smtp_security prev_smtp_security_set=0
   local prev_smtp_subject prev_smtp_subject_set=0
+  local prev_profiles prev_profiles_set=0
   cur_bind="$(config_get "$conf" bind_address)"
   cur_port="$(config_get "$conf" port)"
   cur_jobs="$(config_get "$conf" jobs_dir)"
@@ -737,6 +745,10 @@ cmd_setup() {
     prev_smtp_subject="$(config_get "$conf" smtp_subject)"
     prev_smtp_subject_set=1
   fi
+  if grep -qE '^[[:space:]]*\[\[notification_profiles\]\]' "$conf"; then
+    prev_profiles="$(awk '/^[[:space:]]*\[\[notification_profiles\]\]/{found=1} found' "$conf")"
+    prev_profiles_set=1
+  fi
 
   cur_bind="${cur_bind:-$DEFAULT_BIND}"
   cur_port="${cur_port:-$DEFAULT_PORT}"
@@ -825,6 +837,9 @@ cmd_setup() {
   [[ "$prev_smtp_to_set" -eq 1 ]] && config_set_string "$conf" smtp_to "$prev_smtp_to"
   [[ "$prev_smtp_security_set" -eq 1 ]] && config_set_string "$conf" smtp_security "$prev_smtp_security"
   [[ "$prev_smtp_subject_set" -eq 1 ]] && config_set_string "$conf" smtp_subject "$prev_smtp_subject"
+  if [[ "$prev_profiles_set" -eq 1 ]]; then
+    printf '\n%s\n' "$prev_profiles" >> "$conf"
+  fi
 
   # Preserva o modo mais seguro (segredo em arquivo separado) ao reconfigurar.
   if [[ -n "$cur_token_file" ]]; then

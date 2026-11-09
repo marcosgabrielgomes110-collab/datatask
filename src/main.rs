@@ -154,6 +154,32 @@ struct Config {
     /// Optional e-mail subject; the status is appended when omitted.
     #[serde(default)]
     smtp_subject: Option<String>,
+    /// Additional notification destinations with their own severity filter.
+    #[serde(default)]
+    notification_profiles: Vec<NotificationProfile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationProfile {
+    name: String,
+    /// `webhook` (default) or `email`.
+    #[serde(default = "default_profile_channel")]
+    channel: String,
+    /// Webhook URL for `channel = "webhook"`.
+    #[serde(default)]
+    url: Option<String>,
+    /// Comma-separated recipients for `channel = "email"`; defaults to `smtp_to`.
+    #[serde(default)]
+    to: Option<String>,
+    /// Optional e-mail subject; defaults to `smtp_subject`.
+    #[serde(default)]
+    subject: Option<String>,
+    /// Minimum health status that triggers delivery: `ok`, `warning` or `error`.
+    #[serde(default = "default_min_severity")]
+    min_severity: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
 }
 
 fn default_max_concurrent_jobs() -> usize {
@@ -218,6 +244,18 @@ fn default_smtp_port() -> u16 {
 
 fn default_smtp_security() -> String {
     "starttls".to_owned()
+}
+
+fn default_profile_channel() -> String {
+    "webhook".to_owned()
+}
+
+fn default_min_severity() -> String {
+    "warning".to_owned()
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_job_version() -> u64 {
@@ -1917,8 +1955,20 @@ fn backup_health_snapshot(state: &AppState) -> ApiResult<Value> {
         "remote": remote,
         "encryption": state.config.backup_encryption_key_file.is_some(),
         "alerts_enabled": state.config.backup_alert_url.is_some(),
-        "report_enabled": state.config.backup_health_report_url.is_some()
-            || state.config.backup_health_report_email,
+        "report_enabled": has_health_report_channel(&state.config),
+        "report_profiles": state
+            .config
+            .notification_profiles
+            .iter()
+            .map(|profile| {
+                json!({
+                    "name": profile.name,
+                    "channel": profile.channel,
+                    "min_severity": profile.min_severity,
+                    "enabled": profile.enabled,
+                })
+            })
+            .collect::<Vec<_>>(),
         "report_interval_seconds": state.config.backup_health_report_interval_seconds,
         "retention": state.config.backup_retention,
         "verify_interval_seconds": state.config.backup_verify_interval_seconds,
@@ -2090,7 +2140,12 @@ fn backup_health_document(state: &AppState) -> ApiResult<Value> {
     }))
 }
 
-async fn send_health_email(state: &AppState, document: &Value) -> Result<(), String> {
+async fn send_health_email(
+    state: &AppState,
+    document: &Value,
+    to: Option<&str>,
+    subject: Option<&str>,
+) -> Result<(), String> {
     let host = state
         .config
         .smtp_host
@@ -2103,10 +2158,7 @@ async fn send_health_email(state: &AppState, document: &Value) -> Result<(), Str
         .ok_or_else(|| "smtp_from is not configured.".to_owned())?
         .parse::<Mailbox>()
         .map_err(|error| format!("Invalid smtp_from: {error}"))?;
-    let recipients: Vec<Mailbox> = state
-        .config
-        .smtp_to
-        .as_deref()
+    let recipients: Vec<Mailbox> = to
         .unwrap_or("")
         .split(',')
         .map(str::trim)
@@ -2114,11 +2166,11 @@ async fn send_health_email(state: &AppState, document: &Value) -> Result<(), Str
         .map(|value| {
             value
                 .parse::<Mailbox>()
-                .map_err(|error| format!("Invalid smtp_to '{value}': {error}"))
+                .map_err(|error| format!("Invalid recipient '{value}': {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if recipients.is_empty() {
-        return Err("smtp_to has no recipients.".to_owned());
+        return Err("No e-mail recipients are configured.".to_owned());
     }
 
     let mut builder = match state.config.smtp_security.as_str() {
@@ -2143,10 +2195,9 @@ async fn send_health_email(state: &AppState, document: &Value) -> Result<(), Str
     }
     let transport = builder.build();
     let status = document["health"]["status"].as_str().unwrap_or("unknown");
-    let subject = state
-        .config
-        .smtp_subject
-        .clone()
+    let subject = subject
+        .or(state.config.smtp_subject.as_deref())
+        .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("[DataTask] Backup health: {status}"));
     let mut message = Message::builder().from(from).subject(subject);
     for recipient in recipients {
@@ -2213,48 +2264,105 @@ async fn send_health_email(state: &AppState, document: &Value) -> Result<(), Str
     }
 }
 
+async fn send_health_webhook(state: &AppState, url: &str, document: &Value) -> Result<(), String> {
+    match state.http_client.post(url).json(document).send().await {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(format!(
+            "webhook returned HTTP {}",
+            response.status().as_u16()
+        )),
+        Err(error) => Err(format!("webhook: {error}")),
+    }
+}
+
 async fn send_health_report(state: &AppState) -> Result<(), String> {
-    let webhook = state.config.backup_health_report_url.as_deref();
-    let email = state.config.backup_health_report_email;
-    if webhook.is_none() && !email {
+    if !has_health_report_channel(&state.config) {
         return Err("No health report channel is configured.".to_owned());
     }
     let document = backup_health_document(state).map_err(|error| error.1)?;
+    let status = document["health"]["status"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned();
     let mut delivered = 0usize;
+    let mut skipped = 0usize;
     let mut errors = Vec::new();
 
-    if let Some(url) = webhook {
-        match state.http_client.post(url).json(&document).send().await {
-            Ok(response) if response.status().is_success() => delivered += 1,
-            Ok(response) => errors.push(format!(
-                "webhook returned HTTP {}",
-                response.status().as_u16()
-            )),
-            Err(error) => errors.push(format!("webhook: {error}")),
-        }
-    }
-    if email {
-        match send_health_email(state, &document).await {
+    if let Some(url) = state.config.backup_health_report_url.as_deref() {
+        match send_health_webhook(state, url, &document).await {
             Ok(()) => delivered += 1,
             Err(error) => errors.push(error),
         }
     }
+    if state.config.backup_health_report_email {
+        match send_health_email(state, &document, state.config.smtp_to.as_deref(), None).await {
+            Ok(()) => delivered += 1,
+            Err(error) => errors.push(error),
+        }
+    }
+    for profile in state
+        .config
+        .notification_profiles
+        .iter()
+        .filter(|profile| profile.enabled)
+    {
+        if !severity_allows(&status, &profile.min_severity) {
+            skipped += 1;
+            state.audit(json!({
+                "ts": Local::now().to_rfc3339(),
+                "event": "backup.report_profile",
+                "profile": profile.name,
+                "channel": profile.channel,
+                "skipped": true,
+                "status": status,
+            }));
+            continue;
+        }
+        let result = match profile.channel.as_str() {
+            "webhook" => match profile.url.as_deref() {
+                Some(url) => send_health_webhook(state, url, &document).await,
+                None => Err("url is not configured".to_owned()),
+            },
+            _ => {
+                send_health_email(
+                    state,
+                    &document,
+                    profile.to.as_deref().or(state.config.smtp_to.as_deref()),
+                    profile.subject.as_deref(),
+                )
+                .await
+            }
+        };
+        state.audit(json!({
+            "ts": Local::now().to_rfc3339(),
+            "event": "backup.report_profile",
+            "profile": profile.name,
+            "channel": profile.channel,
+            "ok": result.is_ok(),
+            "error": result.as_ref().err(),
+        }));
+        match result {
+            Ok(()) => delivered += 1,
+            Err(error) => errors.push(format!("{}: {error}", profile.name)),
+        }
+    }
 
     let ok = delivered > 0;
-    state.record_backup_event(
-        BackupEventKind::Report,
-        ok,
-        Some(if errors.is_empty() {
-            format!("{delivered} canal(is)")
-        } else {
-            format!("{delivered} canal(is); {}", errors.join("; "))
-        }),
-    );
+    let mut detail = format!("{delivered} canal(is)");
+    if skipped > 0 {
+        let _ = write!(detail, "; {skipped} perfil(is) ignorado(s) por severidade");
+    }
+    if !errors.is_empty() {
+        let _ = write!(detail, "; {}", errors.join("; "));
+    }
+    state.record_backup_event(BackupEventKind::Report, ok, Some(detail));
     state.audit(json!({
         "ts": Local::now().to_rfc3339(),
         "event": "backup.report",
+        "status": status,
         "ok": ok,
         "delivered": delivered,
+        "skipped": skipped,
         "errors": errors,
     }));
     if ok { Ok(()) } else { Err(errors.join("; ")) }
@@ -2267,7 +2375,7 @@ async fn run_health_report(state: Arc<AppState>) {
 }
 
 async fn send_health_report_endpoint(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
-    if state.config.backup_health_report_url.is_none() && !state.config.backup_health_report_email {
+    if !has_health_report_channel(&state.config) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "No health report channel is configured.",
@@ -2973,6 +3081,123 @@ fn validate_smtp_config(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_notification_profiles(config: &mut Config) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for profile in &mut config.notification_profiles {
+        profile.name = profile.name.trim().to_owned();
+        if profile.name.is_empty() {
+            return Err("notification_profiles.name is required.".to_owned());
+        }
+        if !names.insert(profile.name.to_ascii_lowercase()) {
+            return Err(format!(
+                "Duplicate notification profile name '{}'.",
+                profile.name
+            ));
+        }
+        profile.channel = profile.channel.trim().to_ascii_lowercase();
+        profile.min_severity = profile.min_severity.trim().to_ascii_lowercase();
+        profile.url = profile
+            .url
+            .take()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        profile.to = profile
+            .to
+            .take()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        profile.subject = profile
+            .subject
+            .take()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if !profile.enabled {
+            continue;
+        }
+        if !matches!(profile.channel.as_str(), "webhook" | "email") {
+            return Err(format!(
+                "notification_profiles '{}': channel must be webhook or email.",
+                profile.name
+            ));
+        }
+        if !matches!(profile.min_severity.as_str(), "ok" | "warning" | "error") {
+            return Err(format!(
+                "notification_profiles '{}': min_severity must be ok, warning or error.",
+                profile.name
+            ));
+        }
+        match profile.channel.as_str() {
+            "webhook" => {
+                let url = profile.url.as_deref().ok_or_else(|| {
+                    format!("notification_profiles '{}': url is required.", profile.name)
+                })?;
+                normalize_notify_url(Some(url)).map_err(|error| error.1)?;
+            }
+            _ => {
+                if config.smtp_host.is_none() || config.smtp_from.is_none() {
+                    return Err(format!(
+                        "notification_profiles '{}': smtp_host and smtp_from are required for email.",
+                        profile.name
+                    ));
+                }
+                let recipients = profile
+                    .to
+                    .as_deref()
+                    .or(config.smtp_to.as_deref())
+                    .ok_or_else(|| {
+                        format!(
+                            "notification_profiles '{}': to (or smtp_to) is required.",
+                            profile.name
+                        )
+                    })?;
+                let mut found = false;
+                for recipient in recipients.split(',').map(str::trim) {
+                    if recipient.is_empty() {
+                        continue;
+                    }
+                    recipient.parse::<Mailbox>().map_err(|error| {
+                        format!(
+                            "notification_profiles '{}': invalid recipient '{recipient}': {error}",
+                            profile.name
+                        )
+                    })?;
+                    found = true;
+                }
+                if !found {
+                    return Err(format!(
+                        "notification_profiles '{}': to has no recipients.",
+                        profile.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_notification_profiles(config: &Config) -> bool {
+    config.notification_profiles.iter().any(|p| p.enabled)
+}
+
+fn has_health_report_channel(config: &Config) -> bool {
+    config.backup_health_report_url.is_some()
+        || config.backup_health_report_email
+        || has_notification_profiles(config)
+}
+
+fn severity_allows(status: &str, min_severity: &str) -> bool {
+    let rank = |value: &str| match value {
+        "ok" | "disabled" => Some(0),
+        "warning" => Some(1),
+        "error" => Some(2),
+        _ => None,
+    };
+    match (rank(status), rank(min_severity)) {
+        (Some(status), Some(minimum)) => status >= minimum,
+        _ => true,
+    }
+}
+
 fn load_config(path: &FsPath) -> Result<(Config, String), String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("Cannot read config {}: {error}", path.display()))?;
@@ -3089,6 +3314,7 @@ fn load_config(path: &FsPath) -> Result<(Config, String), String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     validate_smtp_config(&config)?;
+    validate_notification_profiles(&mut config)?;
     for path in [&mut config.tls_cert_file, &mut config.tls_key_file] {
         if let Some(path) = path
             && path.is_relative()
@@ -5036,8 +5262,13 @@ async fn get_info(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> 
         "backup_encryption": state.config.backup_encryption_key_file.is_some(),
         "backup_verify_interval_seconds": state.config.backup_verify_interval_seconds,
         "backup_alert_enabled": state.config.backup_alert_url.is_some(),
-        "backup_health_report_enabled": state.config.backup_health_report_url.is_some()
-            || state.config.backup_health_report_email,
+        "backup_health_report_enabled": has_health_report_channel(&state.config),
+        "backup_health_report_profiles": state
+            .config
+            .notification_profiles
+            .iter()
+            .filter(|profile| profile.enabled)
+            .count(),
         "backup_health_report_interval_seconds": state.config
             .backup_health_report_interval_seconds,
         "backup_last_verify": last_backup_verify,
@@ -5174,8 +5405,7 @@ async fn scheduler(state: Arc<AppState>) {
                 });
             }
         }
-        if (state.config.backup_health_report_url.is_some()
-            || state.config.backup_health_report_email)
+        if has_health_report_channel(&state.config)
             && state.config.backup_health_report_interval_seconds > 0
         {
             let due = last_report.is_none_or(|last| {
@@ -5672,6 +5902,20 @@ mod tests {
             Duration::from_secs(MAX_RETRY_DELAY_SECONDS)
         );
         assert_eq!(retry_delay(1, 0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn severity_allows_only_configured_levels() {
+        assert!(severity_allows("ok", "ok"));
+        assert!(!severity_allows("ok", "warning"));
+        assert!(!severity_allows("ok", "error"));
+        assert!(severity_allows("warning", "ok"));
+        assert!(severity_allows("warning", "warning"));
+        assert!(!severity_allows("warning", "error"));
+        assert!(severity_allows("error", "ok"));
+        assert!(severity_allows("error", "warning"));
+        assert!(severity_allows("error", "error"));
+        assert!(severity_allows("disabled", "ok"));
     }
 
     #[test]
